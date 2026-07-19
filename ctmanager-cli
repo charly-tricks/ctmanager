@@ -446,6 +446,65 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════════
+#  DESINSTALACION
+# ════════════════════════════════════════════════════════════
+# Deja el VPS como estaba: saca el servicio, el cron, los
+# usuarios creados, la base y el binario.
+# Requiere --yes para no borrar nada por accidente.
+cmd_uninstall() {
+    local confirm="${1:-}"
+    if [ "$confirm" != "--yes" ]; then
+        if [ "$JSON" -eq 1 ]; then
+            fail 2 "requiere --yes para confirmar"
+        fi
+        echo "  ATENCION: esto elimina TODO lo que instalo ctmanager-cli:"
+        echo "    - servicio ctmanager-limiter"
+        echo "    - cron de vencimientos"
+        echo "    - TODOS los usuarios SSH creados (y los desconecta)"
+        echo "    - la base de datos $DB"
+        echo "    - el binario /usr/local/bin/ctmanager-cli"
+        echo ""
+        echo "  Si estas seguro:  ctmanager-cli uninstall --yes"
+        exit 2
+    fi
+
+    local borrados=0
+
+    # 1. Parar el limitador
+    systemctl stop ctmanager-limiter 2>/dev/null
+    systemctl disable ctmanager-limiter 2>/dev/null
+    rm -f /etc/systemd/system/ctmanager-limiter.service
+    systemctl daemon-reload 2>/dev/null
+
+    # 2. Sacar el cron
+    rm -f /etc/cron.d/ctmanager-check
+
+    # 3. Eliminar los usuarios que creamos (solo los que estan en la base)
+    while IFS= read -r user; do
+        [ -z "$user" ] && continue
+        valid_user "$user" || continue
+        pkill -u "$user" 2>/dev/null
+        userdel -r "$user" 2>/dev/null
+        borrados=$((borrados+1))
+    done < <(sqlite3 "$DB" "SELECT username FROM users;" 2>/dev/null)
+
+    # 4. Base y logs
+    rm -f "$DB"
+    rm -f "$LOG"
+    rmdir "$(dirname "$DB")" 2>/dev/null
+    rmdir "$(dirname "$LOG")" 2>/dev/null
+    rmdir /etc/ctmanager 2>/dev/null
+
+    ok "desinstalacion completa" "usuarios_eliminados=$borrados" \
+       "nota=el binario se borra al salir"
+
+    # 5. El binario, al final. Borrarse a si mismo es seguro en
+    #    Linux: el proceso ya esta cargado en memoria.
+    rm -f /usr/local/bin/ctmanager-cli
+    exit 0
+}
+
+# ════════════════════════════════════════════════════════════
 #  DISPATCH
 # ════════════════════════════════════════════════════════════
 uso() {
@@ -465,6 +524,7 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   sync                          rehacer usuarios del sistema desde la base
   install-limiter               instalar servicio + cron
   limiter-daemon                loop del limitador (lo usa systemd)
+  uninstall --yes               borrar TODO lo instalado
 
   Agregar --json a cualquier comando para salida parseable.
 EOF
@@ -493,6 +553,7 @@ case "${1:-}" in
     sync)            shift; cmd_sync "$@" ;;
     limiter-daemon)  shift; cmd_limiter_daemon ;;
     install-limiter) shift; cmd_install_limiter ;;
+    uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
     *)               fail 2 "comando desconocido: $1" ;;
 esac
