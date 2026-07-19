@@ -51,12 +51,16 @@ init_db() {
         username   TEXT UNIQUE NOT NULL,
         password   TEXT NOT NULL,
         limite     INTEGER DEFAULT 1,
+        mb_limit   INTEGER DEFAULT 0,
+        bytes_uso  INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now')),
         expires_at TEXT,
         activo     INTEGER DEFAULT 1
     );" 2>/dev/null
-    # Columna agregada respecto del esquema viejo de ctmanager.sh
+    # Columnas agregadas respecto del esquema viejo de ctmanager.sh
     sqlite3 "$DB" "ALTER TABLE users ADD COLUMN limite INTEGER DEFAULT 1;" 2>/dev/null
+    sqlite3 "$DB" "ALTER TABLE users ADD COLUMN mb_limit INTEGER DEFAULT 0;" 2>/dev/null
+    sqlite3 "$DB" "ALTER TABLE users ADD COLUMN bytes_uso INTEGER DEFAULT 0;" 2>/dev/null
     return 0
 }
 
@@ -98,7 +102,8 @@ sesc() { printf '%s' "$1" | sed "s/'/''/g"; }
 # Charset restringido a proposito: si no entra nada raro, no hay
 # inyeccion posible ni sorpresas al pasar por el bot.
 valid_user() {
-    [[ "$1" =~ ^[a-z_][a-z0-9_-]{2,30}$ ]] || return 1
+    # Hasta 32 caracteres: un HWID de HTTP Custom son 32 hex.
+    [[ "$1" =~ ^[a-z_0-9][a-z0-9_-]{2,31}$ ]] || return 1
     # Nombres reservados del sistema
     case "$1" in
         root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|\
@@ -122,17 +127,228 @@ db_has() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  CONTABILIDAD DE DATOS (iptables por UID)
+# ════════════════════════════════════════════════════════════
+# Como funciona:
+#   Cada usuario tiene una regla en la cadena CTMANAGER_ACCT que
+#   cuenta los bytes que emite su proceso sshd. Eso incluye tanto
+#   lo que el cliente sube a internet como lo que baja hacia el
+#   cliente, porque en ambos casos el que envia es sshd.
+#   El demonio lee los contadores, los suma en la base y los
+#   pone en cero de forma atomica (-Z).
+ACCT_CHAIN="CTMANAGER_ACCT"
+ACCT_INTERVAL="${CTMANAGER_ACCT_INTERVAL:-60}"
+
+acct_disponible() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    iptables -m owner --help >/dev/null 2>&1 || true
+    return 0
+}
+
+acct_init_chain() {
+    iptables -N "$ACCT_CHAIN" 2>/dev/null
+    # Enganchar la cadena a OUTPUT una sola vez
+    iptables -C OUTPUT -j "$ACCT_CHAIN" 2>/dev/null \
+        || iptables -I OUTPUT -j "$ACCT_CHAIN" 2>/dev/null
+    return 0
+}
+
+acct_add_user() {
+    local user="$1"
+    local uid; uid=$(id -u "$user" 2>/dev/null) || return 1
+    acct_init_chain
+    iptables -C "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
+        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null && return 0
+    iptables -A "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
+        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null
+    return 0
+}
+
+acct_del_user() {
+    local user="$1"
+    local uid; uid=$(id -u "$user" 2>/dev/null)
+    [ -n "$uid" ] && iptables -D "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
+        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null
+    return 0
+}
+
+# Lee y resetea los contadores. Devuelve lineas "usuario bytes".
+acct_leer_y_resetear() {
+    iptables -L "$ACCT_CHAIN" -vnxZ 2>/dev/null | awk '
+        /ctm:/ {
+            bytes = $2
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^ctm:/) {
+                    sub(/^ctm:/, "", $i)
+                    print $i, bytes
+                    break
+                }
+            }
+        }'
+}
+
+mb_humano() {   # bytes -> texto legible
+    local b="${1:-0}"
+    if   [ "$b" -ge 1073741824 ]; then awk "BEGIN{printf \"%.2f GB\", $b/1073741824}"
+    elif [ "$b" -ge 1048576 ];    then awk "BEGIN{printf \"%.1f MB\", $b/1048576}"
+    else echo "${b} B"; fi
+}
+
+cmd_quota() {
+    local user="${1:-}" cant="${2:-}" unidad="${3:-GB}"
+    [ -n "$user" ] && [ -n "$cant" ] || fail 2 "uso: quota USER CANTIDAD [MB|GB]   (0 = ilimitado)"
+    valid_user "$user" || fail 2 "usuario invalido"
+    valid_num  "$cant" || fail 2 "la cantidad debe ser un numero entero"
+    db_has "$user"     || fail 3 "el usuario no existe en la base"
+
+    local mb
+    case "${unidad^^}" in
+        MB) mb=$cant ;;
+        GB) mb=$((cant * 1024)) ;;
+        TB) mb=$((cant * 1024 * 1024)) ;;
+        *)  fail 2 "unidad invalida: usar MB, GB o TB" ;;
+    esac
+
+    local u; u="$(sesc "$user")"
+    sqlite3 "$DB" "UPDATE users SET mb_limit=$mb WHERE username='$u';" 2>/dev/null
+    log "quota $user = ${cant}${unidad^^}"
+    ok "cuota actualizada" "usuario=$user" \
+       "cuota=$([ "$mb" -eq 0 ] && echo ilimitada || echo "${cant} ${unidad^^}")" \
+       "mb=$mb"
+}
+
+cmd_usage() {
+    local user="${1:-}"
+    [ -n "$user" ] || fail 2 "uso: usage USER"
+    valid_user "$user" || fail 2 "usuario invalido"
+    db_has "$user"     || fail 3 "el usuario no existe en la base"
+
+    local u; u="$(sesc "$user")"
+    local row; row=$(sqlite3 "$DB" "SELECT COALESCE(bytes_uso,0), COALESCE(mb_limit,0),
+        COALESCE(expires_at,''), activo FROM users WHERE username='$u';" 2>/dev/null)
+    IFS='|' read -r bytes mblim exp act <<< "$row"
+
+    local limbytes=$((mblim * 1048576))
+    local pct=0
+    [ "$limbytes" -gt 0 ] && pct=$(( bytes * 100 / limbytes ))
+    local restante=0
+    [ "$limbytes" -gt 0 ] && restante=$(( limbytes - bytes ))
+    [ "$restante" -lt 0 ] && restante=0
+
+    if [ "$JSON" -eq 1 ]; then
+        echo "{\"ok\":true,\"usuario\":\"$(jesc "$user")\",\"bytes\":$bytes,\
+\"usado\":\"$(mb_humano "$bytes")\",\"cuota_mb\":$mblim,\
+\"restante\":\"$([ "$limbytes" -gt 0 ] && mb_humano "$restante" || echo ilimitado)\",\
+\"porcentaje\":$pct,\"expira\":\"$(jesc "$exp")\",\"activo\":$act}"
+    else
+        echo "  Usuario   : $user"
+        echo "  Consumido : $(mb_humano "$bytes")"
+        if [ "$limbytes" -gt 0 ]; then
+            echo "  Cuota     : $((mblim / 1024)) GB  (${pct}% usado)"
+            echo "  Restante  : $(mb_humano "$restante")"
+        else
+            echo "  Cuota     : ilimitada"
+        fi
+        echo "  Expira    : ${exp:-sin limite}"
+    fi
+}
+
+cmd_reset_usage() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail 2 "uso: reset-usage USER   |   reset-usage --all"
+
+    if [ "$arg" = "--all" ]; then
+        sqlite3 "$DB" "UPDATE users SET bytes_uso=0;" 2>/dev/null
+        iptables -Z "$ACCT_CHAIN" 2>/dev/null
+        log "reset-usage --all"
+        ok "consumo reseteado para todos"
+    else
+        valid_user "$arg" || fail 2 "usuario invalido"
+        db_has "$arg"     || fail 3 "el usuario no existe en la base"
+        local u; u="$(sesc "$arg")"
+        sqlite3 "$DB" "UPDATE users SET bytes_uso=0 WHERE username='$u';" 2>/dev/null
+        log "reset-usage $arg"
+        ok "consumo reseteado" "usuario=$arg"
+    fi
+}
+
+cmd_accounting_daemon() {
+    init_db
+    acct_init_chain
+    # Registrar a todos los usuarios activos por si el VPS se reinicio
+    while IFS= read -r user; do
+        [ -n "$user" ] && acct_add_user "$user"
+    done < <(sqlite3 "$DB" "SELECT username FROM users WHERE activo=1;" 2>/dev/null)
+
+    log "contador de datos iniciado (intervalo ${ACCT_INTERVAL}s)"
+    while true; do
+        while read -r user bytes; do
+            [ -z "$user" ] && continue
+            [ "${bytes:-0}" -eq 0 ] && continue
+            valid_user "$user" || continue
+            local u; u="$(sesc "$user")"
+            sqlite3 "$DB" "UPDATE users SET bytes_uso = COALESCE(bytes_uso,0) + $bytes
+                           WHERE username='$u';" 2>/dev/null
+        done < <(acct_leer_y_resetear)
+
+        # Bloquear a los que pasaron la cuota
+        while IFS= read -r user; do
+            [ -z "$user" ] && continue
+            valid_user "$user" || continue
+            usermod -L "$user" 2>/dev/null
+            pkill -u "$user" 2>/dev/null
+            local u; u="$(sesc "$user")"
+            sqlite3 "$DB" "UPDATE users SET activo=0 WHERE username='$u';" 2>/dev/null
+            log "cuota agotada, bloqueado: $user"
+        done < <(sqlite3 "$DB" "SELECT username FROM users
+                 WHERE activo=1 AND mb_limit > 0
+                   AND bytes_uso >= mb_limit * 1048576;" 2>/dev/null)
+
+        sleep "$ACCT_INTERVAL"
+    done
+}
+
+cmd_install_accounting() {
+    acct_disponible || fail 1 "iptables no esta disponible en este sistema"
+    local self; self="$(readlink -f "$0")"
+    acct_init_chain
+
+    cat > /etc/systemd/system/ctmanager-acct.service <<EOF
+[Unit]
+Description=CTManager - contador de consumo de datos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$self accounting-daemon
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ctmanager-acct >/dev/null 2>&1
+    systemctl restart ctmanager-acct
+
+    ok "contador de datos instalado" "servicio=ctmanager-acct" \
+       "intervalo=${ACCT_INTERVAL}s"
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
 cmd_add() {
-    local user="${1:-}" pass="${2:-}" dias="${3:-}" limite="${4:-1}"
+    local user="${1:-}" pass="${2:-}" dias="${3:-}" limite="${4:-1}" gb="${5:-0}"
     [ -n "$user" ] && [ -n "$pass" ] && [ -n "$dias" ] \
-        || fail 2 "uso: add USER PASS DIAS [LIMITE]"
+        || fail 2 "uso: add USER PASS DIAS [LIMITE] [GB]"
     valid_user "$user"   || fail 2 "usuario invalido (3-31 chars, minusculas, empieza con letra)"
     valid_pass "$pass"   || fail 2 "password invalido (4-64 chars alfanumericos y ._@#%+=:-)"
     valid_num  "$dias"   || fail 2 "dias debe ser un numero"
     valid_num  "$limite" || fail 2 "limite debe ser un numero"
+    valid_num  "$gb"     || fail 2 "GB debe ser un numero"
 
     id "$user" &>/dev/null && fail 4 "el usuario ya existe en el sistema"
     db_has "$user"        && fail 4 "el usuario ya existe en la base"
@@ -157,14 +373,17 @@ cmd_add() {
     echo "$user:$pass" | chpasswd 2>/dev/null \
         || { userdel "$user" 2>/dev/null; fail 1 "no se pudo asignar el password"; }
 
-    local u p
-    u="$(sesc "$user")"; p="$(sesc "$pass")"
-    sqlite3 "$DB" "INSERT INTO users (username,password,limite,expires_at)
-                   VALUES ('$u','$p',$limite,$expira_db);" 2>/dev/null \
+    local u p mb
+    u="$(sesc "$user")"; p="$(sesc "$pass")"; mb=$((gb * 1024))
+    sqlite3 "$DB" "INSERT INTO users (username,password,limite,mb_limit,expires_at)
+                   VALUES ('$u','$p',$limite,$mb,$expira_db);" 2>/dev/null \
         || { userdel "$user" 2>/dev/null; fail 1 "no se pudo guardar en la base"; }
 
-    log "add $user dias=$dias limite=$limite"
-    ok "usuario creado" "usuario=$user" "expira=${expira_sys:-sin limite}" "limite=$limite"
+    acct_add_user "$user"
+
+    log "add $user dias=$dias limite=$limite gb=$gb"
+    ok "usuario creado" "usuario=$user" "expira=${expira_sys:-sin limite}" \
+       "limite=$limite" "cuota=$([ "$gb" -eq 0 ] && echo ilimitada || echo "${gb} GB")"
 }
 
 cmd_renew() {
@@ -260,6 +479,7 @@ cmd_del() {
 
     pkill -u "$user" 2>/dev/null
     sleep 1
+    acct_del_user "$user"
     if [ "$keep" = "--keep-home" ]; then
         userdel "$user" 2>/dev/null
     else
@@ -470,11 +690,19 @@ cmd_uninstall() {
 
     local borrados=0
 
-    # 1. Parar el limitador
+    # 1. Parar el limitador y el contador de datos
     systemctl stop ctmanager-limiter 2>/dev/null
     systemctl disable ctmanager-limiter 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-limiter.service
+    systemctl stop ctmanager-acct 2>/dev/null
+    systemctl disable ctmanager-acct 2>/dev/null
+    rm -f /etc/systemd/system/ctmanager-acct.service
     systemctl daemon-reload 2>/dev/null
+
+    # 1b. Sacar las reglas de contabilidad
+    iptables -D OUTPUT -j "$ACCT_CHAIN" 2>/dev/null
+    iptables -F "$ACCT_CHAIN" 2>/dev/null
+    iptables -X "$ACCT_CHAIN" 2>/dev/null
 
     # 2. Sacar el cron
     rm -f /etc/cron.d/ctmanager-check
@@ -511,10 +739,13 @@ uso() {
 cat <<'EOF'
 ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
 
-  add USER PASS DIAS [LIMITE]   crear cuenta
+  add USER PASS DIAS [LIMITE] [GB]   crear cuenta
   renew USER DIAS               sumar dias
   passwd USER NEWPASS           cambiar clave
   limit USER N                  cambiar limite de dispositivos
+  quota USER GB                 cambiar cuota de datos (0 = ilimitada)
+  usage USER                    ver consumo de datos
+  reset-usage USER | --all      poner el consumo en cero
   lock USER                     bloquear
   unlock USER                   desbloquear
   del USER [--keep-home]        eliminar
@@ -523,7 +754,9 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   check                         bloquear vencidos (cron)
   sync                          rehacer usuarios del sistema desde la base
   install-limiter               instalar servicio + cron
+  install-accounting            instalar contador de datos
   limiter-daemon                loop del limitador (lo usa systemd)
+  accounting-daemon             loop del contador (lo usa systemd)
   uninstall --yes               borrar TODO lo instalado
 
   Agregar --json a cualquier comando para salida parseable.
@@ -544,6 +777,9 @@ case "${1:-}" in
     renew)           shift; cmd_renew "$@" ;;
     passwd)          shift; cmd_passwd "$@" ;;
     limit)           shift; cmd_limit "$@" ;;
+    quota)           shift; cmd_quota "$@" ;;
+    usage)           shift; cmd_usage "$@" ;;
+    reset-usage)     shift; cmd_reset_usage "$@" ;;
     lock)            shift; cmd_lock "$@" ;;
     unlock)          shift; cmd_unlock "$@" ;;
     del)             shift; cmd_del "$@" ;;
@@ -552,7 +788,9 @@ case "${1:-}" in
     check)           shift; cmd_check "$@" ;;
     sync)            shift; cmd_sync "$@" ;;
     limiter-daemon)  shift; cmd_limiter_daemon ;;
-    install-limiter) shift; cmd_install_limiter ;;
+    install-limiter)    shift; cmd_install_limiter ;;
+    install-accounting) shift; cmd_install_accounting ;;
+    accounting-daemon)  shift; cmd_accounting_daemon ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
     *)               fail 2 "comando desconocido: $1" ;;
