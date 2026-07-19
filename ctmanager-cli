@@ -146,10 +146,10 @@ acct_disponible() {
 }
 
 acct_init_chain() {
-    iptables -N "$ACCT_CHAIN" 2>/dev/null
+    iptables -N "$ACCT_CHAIN" >/dev/null 2>&1
     # Enganchar la cadena a OUTPUT una sola vez
-    iptables -C OUTPUT -j "$ACCT_CHAIN" 2>/dev/null \
-        || iptables -I OUTPUT -j "$ACCT_CHAIN" 2>/dev/null
+    iptables -C OUTPUT -j "$ACCT_CHAIN" >/dev/null 2>&1 \
+        || iptables -I OUTPUT -j "$ACCT_CHAIN" >/dev/null 2>&1
     return 0
 }
 
@@ -158,9 +158,9 @@ acct_add_user() {
     local uid; uid=$(id -u "$user" 2>/dev/null) || return 1
     acct_init_chain
     iptables -C "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
-        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null && return 0
+        -m comment --comment "ctm:$user" -j RETURN >/dev/null 2>&1 && return 0
     iptables -A "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
-        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null
+        -m comment --comment "ctm:$user" -j RETURN >/dev/null 2>&1
     return 0
 }
 
@@ -168,7 +168,7 @@ acct_del_user() {
     local user="$1"
     local uid; uid=$(id -u "$user" 2>/dev/null)
     [ -n "$uid" ] && iptables -D "$ACCT_CHAIN" -m owner --uid-owner "$uid" \
-        -m comment --comment "ctm:$user" -j RETURN 2>/dev/null
+        -m comment --comment "ctm:$user" -j RETURN >/dev/null 2>&1
     return 0
 }
 
