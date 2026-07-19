@@ -60,13 +60,20 @@ function ejecutarCLI(args) {
 }
 
 // Igual que la anterior pero parseando la salida JSON del CLI.
+// Tolerante a ruido: si algun comando del sistema imprime algo antes
+// del JSON, buscamos la ultima linea que sea un objeto JSON valido.
 async function ejecutarJSON(args) {
   const salida = await ejecutarCLI([...args, '--json']);
-  try {
-    return JSON.parse(salida);
-  } catch (e) {
-    return { ok: false, error: salida || 'sin respuesta del CLI' };
+  const lineas = salida.split('\n').map(l => l.trim()).filter(Boolean);
+  for (let i = lineas.length - 1; i >= 0; i--) {
+    const l = lineas[i];
+    if (l.startsWith('{') && l.endsWith('}')) {
+      try {
+        return JSON.parse(l);
+      } catch (e) { /* seguir buscando hacia arriba */ }
+    }
   }
+  return { ok: false, error: salida || 'sin respuesta del CLI' };
 }
 
 // Compatibilidad: el resto del bot puede llamar ejecutarComando()
