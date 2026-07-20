@@ -149,7 +149,8 @@ def leer_usuarios():
 
 def estado_sistema():
     servicios = {}
-    for s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws", "ctmanager-panel"):
+    for s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws",
+              "ctmanager-badvpn", "ctmanager-panel"):
         try:
             r = subprocess.run(["systemctl", "is-active", s],
                                capture_output=True, text=True, timeout=5)
@@ -629,6 +630,7 @@ async function cargar(){
     'ctmanager-limiter':'Límite de dispositivos',
     'ctmanager-acct':'Contador de datos',
     'ctmanager-ws':'Proxy WebSocket',
+    'ctmanager-badvpn':'Soporte UDP (BadVPN)',
     'ctmanager-panel':'Panel web',
     'ssh':'Servidor SSH'
   };
