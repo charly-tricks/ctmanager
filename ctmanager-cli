@@ -497,6 +497,95 @@ cmd_banner_edit() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  BADVPN / UDPGW  (para que funcione el UDP)
+# ════════════════════════════════════════════════════════════
+# Sin esto, el tunel SSH solo pasa TCP: el cliente navega bien
+# pero se le cortan las videollamadas, los juegos y los audios
+# de WhatsApp. udpgw hace de puente para el trafico UDP.
+#
+# El binario se compila desde el repositorio oficial. Muchos
+# scripts lo bajan ya compilado de Dropbox o de un Drive, sin
+# forma de verificar que sea; asi sabemos exactamente que corre.
+BADVPN_PORT="${CTMANAGER_BADVPN_PORT:-7300}"
+BADVPN_BIN="/usr/local/bin/badvpn-udpgw"
+BADVPN_SRC="https://github.com/ambrop72/badvpn.git"
+
+cmd_install_badvpn() {
+    if [ -x "$BADVPN_BIN" ]; then
+        [ "$JSON" -eq 1 ] || echo "  El binario ya existe, salteando la compilacion."
+    else
+        [ "$JSON" -eq 1 ] || echo "  Instalando dependencias..."
+        if   command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq cmake build-essential git >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q cmake gcc gcc-c++ make git >/dev/null 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm cmake base-devel git >/dev/null 2>&1
+        fi
+
+        command -v cmake >/dev/null 2>&1 || fail 1 "falta cmake y no se pudo instalar"
+        command -v git   >/dev/null 2>&1 || fail 1 "falta git y no se pudo instalar"
+
+        local tmp; tmp=$(mktemp -d /tmp/badvpn.XXXXXX) || fail 1 "no se pudo crear el directorio temporal"
+        [ "$JSON" -eq 1 ] || echo "  Compilando badvpn-udpgw (tarda un par de minutos)..."
+
+        if ! git clone --depth 1 "$BADVPN_SRC" "$tmp/badvpn" >/dev/null 2>&1; then
+            rm -rf "$tmp"; fail 1 "no se pudo descargar el codigo fuente de badvpn"
+        fi
+        mkdir -p "$tmp/build"
+        # Solo se compila udpgw: el resto del proyecto no hace falta.
+        if ! (cd "$tmp/build" && cmake "$tmp/badvpn" \
+                -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1 \
+                && make >/dev/null 2>&1); then
+            rm -rf "$tmp"; fail 1 "fallo la compilacion de badvpn-udpgw"
+        fi
+
+        local compilado
+        compilado=$(find "$tmp/build" -name "badvpn-udpgw" -type f | head -1)
+        [ -n "$compilado" ] || { rm -rf "$tmp"; fail 1 "no se encontro el binario compilado"; }
+        install -m 755 "$compilado" "$BADVPN_BIN"
+        rm -rf "$tmp"
+    fi
+
+    # Escucha solo en localhost: el cliente llega por dentro del
+    # tunel SSH, asi que no hace falta exponerlo a internet.
+    cat > /etc/systemd/system/ctmanager-badvpn.service <<EOF
+[Unit]
+Description=CTManager - BadVPN udpgw (soporte UDP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BADVPN_BIN --listen-addr 127.0.0.1:$BADVPN_PORT --max-clients 1000 --max-connections-for-client 10
+Restart=always
+RestartSec=5
+User=nobody
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ctmanager-badvpn >/dev/null 2>&1
+    systemctl restart ctmanager-badvpn
+    sleep 2
+
+    if systemctl is-active --quiet ctmanager-badvpn; then
+        log "badvpn instalado en 127.0.0.1:$BADVPN_PORT"
+        ok "BadVPN instalado" "escucha=127.0.0.1:$BADVPN_PORT" \
+           "nota=en la app poner UDPGW 127.0.0.1:$BADVPN_PORT"
+    else
+        fail 1 "el servicio no arranco. Ver: journalctl -u ctmanager-badvpn -n 20"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
@@ -860,6 +949,10 @@ cmd_uninstall() {
     systemctl stop ctmanager-acct 2>/dev/null
     systemctl disable ctmanager-acct 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-acct.service
+    systemctl stop ctmanager-badvpn 2>/dev/null
+    systemctl disable ctmanager-badvpn 2>/dev/null
+    rm -f /etc/systemd/system/ctmanager-badvpn.service
+    rm -f "$BADVPN_BIN"
     systemctl daemon-reload 2>/dev/null
 
     # 1b. Sacar las reglas de contabilidad
@@ -928,6 +1021,7 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   sync                          rehacer usuarios del sistema desde la base
   install-limiter               instalar servicio + cron
   install-accounting            instalar contador de datos
+  install-badvpn                instalar BadVPN (soporte UDP)
   limiter-daemon                loop del limitador (lo usa systemd)
   accounting-daemon             loop del contador (lo usa systemd)
   uninstall --yes               borrar TODO lo instalado
@@ -965,6 +1059,7 @@ case "${1:-}" in
     limiter-daemon)  shift; cmd_limiter_daemon ;;
     install-limiter)    shift; cmd_install_limiter ;;
     install-accounting) shift; cmd_install_accounting ;;
+    install-badvpn)     shift; cmd_install_badvpn ;;
     accounting-daemon)  shift; cmd_accounting_daemon ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
