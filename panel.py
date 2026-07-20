@@ -149,15 +149,24 @@ def leer_usuarios():
 
 def estado_sistema():
     servicios = {}
-    for s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws", "ssh", "sshd"):
+    for s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws", "ctmanager-panel"):
         try:
             r = subprocess.run(["systemctl", "is-active", s],
                                capture_output=True, text=True, timeout=5)
-            estado = r.stdout.strip()
-            if estado != "inactive" or s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws"):
-                servicios[s] = estado
+            servicios[s] = r.stdout.strip()
         except Exception:
             pass
+    # ssh y sshd son el mismo servicio segun la distro: mostrar uno solo
+    for s in ("ssh", "sshd"):
+        try:
+            r = subprocess.run(["systemctl", "is-active", s],
+                               capture_output=True, text=True, timeout=5)
+            if r.stdout.strip() == "active":
+                servicios["ssh"] = "active"
+                break
+        except Exception:
+            pass
+    servicios.setdefault("ssh", "inactive")
 
     puertos = []
     try:
@@ -243,6 +252,42 @@ async def accion(request: Request):
 
 
 # ── Interfaz ─────────────────────────────────────────────────
+BANNER_TPL = "/etc/ctmanager/banner.tpl"
+BANNER_DEFECTO = (
+    '<font color="green">Usuario: USER</font>\n'
+    '<font color="blue">Vence: EXP  (DAYS dias)</font>\n'
+    '<font color="orange">Consumido: TRF de LIMIT</font>\n'
+)
+
+
+@app.get("/api/banner")
+async def ver_banner(request: Request):
+    exigir_sesion(request)
+    try:
+        with open(BANNER_TPL) as f:
+            return {"ok": True, "texto": f.read()}
+    except FileNotFoundError:
+        return {"ok": True, "texto": BANNER_DEFECTO}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/banner")
+async def guardar_banner(request: Request):
+    exigir_sesion(request)
+    d = await request.json()
+    texto = str(d.get("texto", ""))
+    if len(texto) > 4000:
+        return {"ok": False, "error": "El banner es demasiado largo (máximo 4000 caracteres)"}
+    try:
+        os.makedirs(os.path.dirname(BANNER_TPL), exist_ok=True)
+        with open(BANNER_TPL, "w") as f:
+            f.write(texto)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return cli("banner-sync")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def raiz(request: Request):
     return HTMLResponse(PAGINA)
@@ -350,6 +395,32 @@ PAGINA = r"""<!DOCTYPE html>
 
   .vacio{text-align:center;color:var(--dim);padding:32px 16px;font-size:14px}
 
+  /* interruptor de modo */
+  .palanca{display:flex;align-items:center;gap:10px;cursor:pointer;
+           margin-bottom:14px;user-select:none}
+  .riel{width:42px;height:24px;background:var(--ink);border:1px solid var(--line);
+        border-radius:12px;position:relative;flex:none;transition:background .15s}
+  .riel.on{background:var(--signal);border-color:var(--signal)}
+  .perilla{width:18px;height:18px;background:var(--dim);border-radius:50%;
+           position:absolute;top:2px;left:2px;transition:transform .15s,background .15s}
+  .riel.on .perilla{transform:translateX(18px);background:#0D1017}
+  .palanca span{font-size:13px;color:var(--dim)}
+
+  .ayuda{font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.4}
+
+  /* editor de banner */
+  .fichas{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .fichas button{background:var(--raise);border:1px solid var(--line);
+                 color:var(--signal);font-family:var(--mono);font-size:11px;
+                 padding:5px 9px;border-radius:6px;cursor:pointer;letter-spacing:.05em}
+  textarea{width:100%;background:var(--ink);border:1px solid var(--line);
+           color:var(--text);padding:11px;border-radius:8px;font-size:13px;
+           font-family:var(--mono);margin-bottom:12px;resize:vertical;line-height:1.5}
+  textarea:focus{outline:2px solid var(--signal);outline-offset:-1px}
+  .previa{background:#000;border:1px solid var(--line);border-radius:8px;
+          padding:12px;font-family:var(--mono);font-size:13px;line-height:1.6;
+          margin-bottom:12px;min-height:60px;word-break:break-word}
+
   /* entrar */
   #entrar{max-width:320px;margin:18vh auto;padding:0 16px}
   #entrar h1{font-family:var(--mono);font-size:18px;letter-spacing:.16em;
@@ -392,10 +463,24 @@ PAGINA = r"""<!DOCTYPE html>
 
     <h2>Crear cuenta</h2>
     <div class="caja">
-      <label>Usuario</label>
-      <input id="nUsuario" placeholder="juan" autocapitalize="off">
-      <label>Contraseña</label>
-      <input id="nClave" placeholder="dejar vacío para generar una">
+      <div class="palanca" onclick="cambiarModo()">
+        <div class="riel" id="riel"><div class="perilla"></div></div>
+        <span id="modoTexto">Usuario y contraseña</span>
+      </div>
+
+      <div id="campoNormal">
+        <label>Usuario</label>
+        <input id="nUsuario" placeholder="juan" autocapitalize="off">
+        <label>Contraseña</label>
+        <input id="nClave" placeholder="dejar vacío para generar una">
+      </div>
+
+      <div id="campoHwid" style="display:none">
+        <label>HWID del dispositivo</label>
+        <input id="nHwid" placeholder="32 caracteres" autocapitalize="off">
+        <p class="ayuda" id="pistaHwid">Se copia desde la app del cliente.</p>
+      </div>
+
       <div class="duo">
         <div><label>Días</label><input id="nDias" type="number" value="30" inputmode="numeric"></div>
         <div><label>Dispositivos</label><input id="nDisp" type="number" value="1" inputmode="numeric"></div>
@@ -403,6 +488,24 @@ PAGINA = r"""<!DOCTYPE html>
       <label>Datos en GB (0 = sin límite)</label>
       <input id="nGb" type="number" value="0" inputmode="numeric">
       <button class="principal" onclick="crear()">Crear cuenta</button>
+    </div>
+
+    <h2>Mensaje al conectar</h2>
+    <div class="caja">
+      <p class="ayuda">Esto ve el cliente en su app al conectarse.
+         Tocá una etiqueta para insertarla.</p>
+      <div class="fichas">
+        <button onclick="insertar('USER')">USER</button>
+        <button onclick="insertar('EXP')">EXP</button>
+        <button onclick="insertar('DAYS')">DAYS</button>
+        <button onclick="insertar('TRF')">TRF</button>
+        <button onclick="insertar('LIMIT')">LIMIT</button>
+      </div>
+      <textarea id="bTexto" rows="5" spellcheck="false"
+                oninput="verPrevia()"></textarea>
+      <label>Así lo va a ver</label>
+      <div class="previa" id="bPrevia"></div>
+      <button class="principal" onclick="guardarBanner()">Guardar mensaje</button>
     </div>
 
     <h2>Servidor</h2>
@@ -446,7 +549,7 @@ async function entrar(){
   if(d.ok){
     document.getElementById('entrar').style.display='none';
     document.getElementById('app').style.display='block';
-    cargar();
+    cargar(); cargarBanner();
   } else {
     avisar(d.error || 'No se pudo entrar', true);
   }
@@ -526,7 +629,8 @@ async function cargar(){
     'ctmanager-limiter':'Límite de dispositivos',
     'ctmanager-acct':'Contador de datos',
     'ctmanager-ws':'Proxy WebSocket',
-    'ssh':'Servidor SSH', 'sshd':'Servidor SSH'
+    'ctmanager-panel':'Panel web',
+    'ssh':'Servidor SSH'
   };
   for(const [k,v] of Object.entries(s.servicios)){
     const vivo = v === 'active';
@@ -543,14 +647,37 @@ async function cargar(){
     new Date().toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'});
 }
 
+let modoHwid = false;
+
+function cambiarModo(){
+  modoHwid = !modoHwid;
+  document.getElementById('riel').classList.toggle('on', modoHwid);
+  document.getElementById('modoTexto').textContent =
+    modoHwid ? 'Cuenta por HWID' : 'Usuario y contraseña';
+  document.getElementById('campoNormal').style.display = modoHwid ? 'none' : 'block';
+  document.getElementById('campoHwid').style.display  = modoHwid ? 'block' : 'none';
+}
+
 async function crear(){
-  const usuario = document.getElementById('nUsuario').value.trim().toLowerCase();
-  if(!usuario){ avisar('Escribí un nombre de usuario', true); return; }
-  let clave = document.getElementById('nClave').value.trim();
-  if(!clave){
-    const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-    clave = Array.from({length:10}, ()=> abc[Math.floor(Math.random()*abc.length)]).join('');
+  let usuario, clave;
+
+  if(modoHwid){
+    const hwid = document.getElementById('nHwid').value.trim().toLowerCase();
+    if(!/^[a-f0-9]{32}$/.test(hwid)){
+      avisar('El HWID tiene que ser de 32 caracteres (0-9, a-f)', true);
+      return;
+    }
+    usuario = hwid; clave = hwid;
+  } else {
+    usuario = document.getElementById('nUsuario').value.trim().toLowerCase();
+    if(!usuario){ avisar('Escribí un nombre de usuario', true); return; }
+    clave = document.getElementById('nClave').value.trim();
+    if(!clave){
+      const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+      clave = Array.from({length:10}, ()=> abc[Math.floor(Math.random()*abc.length)]).join('');
+    }
   }
+
   const d = await pedir('/api/crear', {
     usuario, clave,
     dias: +document.getElementById('nDias').value || 30,
@@ -558,13 +685,54 @@ async function crear(){
     gb: +document.getElementById('nGb').value || 0
   });
   if(d.ok){
-    avisar('Cuenta creada: ' + usuario + ' / ' + clave);
+    avisar(modoHwid ? 'Cuenta HWID creada' : ('Cuenta creada: ' + usuario + ' / ' + clave));
     document.getElementById('nUsuario').value = '';
     document.getElementById('nClave').value = '';
+    document.getElementById('nHwid').value = '';
     cargar();
   } else {
     avisar(d.error || 'No se pudo crear', true);
   }
+}
+
+/* ── Editor del mensaje al conectar ─────────────────── */
+function insertar(etiqueta){
+  const t = document.getElementById('bTexto');
+  const i = t.selectionStart;
+  t.value = t.value.slice(0, i) + etiqueta + t.value.slice(t.selectionEnd);
+  t.focus();
+  t.selectionStart = t.selectionEnd = i + etiqueta.length;
+  verPrevia();
+}
+
+function verPrevia(){
+  const ejemplo = {
+    USER: 'juan', EXP: '2026-08-19', DAYS: '29',
+    TRF: '3.40 GB', LIMIT: '10.00 GB'
+  };
+  let html = document.getElementById('bTexto').value;
+  html = html.replace(/<\s*(script|iframe|img|svg|style)/gi, '&lt;$1');
+  for(const [k,v] of Object.entries(ejemplo)){
+    html = html.split(k).join(v);
+  }
+  document.getElementById('bPrevia').innerHTML = html.replace(/\n/g, '<br>');
+}
+
+async function cargarBanner(){
+  try{
+    const d = await pedir('/api/banner');
+    if(d.ok){
+      document.getElementById('bTexto').value = d.texto;
+      verPrevia();
+    }
+  }catch(e){}
+}
+
+async function guardarBanner(){
+  const texto = document.getElementById('bTexto').value;
+  const d = await pedir('/api/banner', {texto});
+  avisar(d.ok ? 'Mensaje guardado y aplicado a todas las cuentas'
+              : (d.error || 'No se pudo guardar'), !d.ok);
 }
 
 async function accion(usuario, acc){
@@ -596,7 +764,7 @@ fetch('/api/datos').then(r => {
   if(r.ok){
     document.getElementById('entrar').style.display='none';
     document.getElementById('app').style.display='block';
-    cargar();
+    cargar(); cargarBanner();
   }
 });
 
