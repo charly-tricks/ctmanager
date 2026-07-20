@@ -64,34 +64,56 @@ def forward(src, dst):
                 pass
 
 
+def parece_http(data):
+    """True si el bloque recibido es un request HTTP y no SSH."""
+    if data[:4] == b"SSH-":
+        return False
+    inicio = data[:8].upper()
+    for verbo in (b"GET", b"POST", b"HEAD", b"PUT", b"OPTIONS",
+                  b"CONNECT", b"DELETE", b"TRACE", b"PATCH"):
+        if inicio.startswith(verbo):
+            return True
+    return b"HTTP/" in data[:64].upper()
+
+
 def handle_client(client, cfg):
     payload = PAYLOADS.get(str(cfg.get("payload", "101")), PAYLOADS["101"])
     host = cfg.get("target_host", "127.0.0.1")
     port = int(cfg.get("target_port", 22))
     dest = None
+    pendiente = b""
     try:
-        client.settimeout(15)
-        # Leer el request inicial de la app (no nos importa el contenido)
-        try:
-            client.recv(8192)
-        except socket.timeout:
-            pass
+        client.settimeout(20)
 
-        # Contestar el payload que la app espera
-        client.sendall(payload)
+        # Algunas apps (HTTP Custom entre ellas) mandan MAS DE UN
+        # request antes de empezar el SSH. Hay que contestarle a
+        # todos. Si en vez de eso reenviaramos el segundo request al
+        # sshd, este responde "Invalid SSH identification string" y
+        # la app lo lee como tamano de paquete -> "Illegal packet size".
+        for _ in range(5):
+            try:
+                data = client.recv(8192)
+            except socket.timeout:
+                data = b""
+            if not data:
+                break
+            if parece_http(data):
+                client.sendall(payload)
+                continue
+            # Ya no es HTTP: esto es el saludo SSH, va al puente.
+            pendiente = data
+            break
 
-        # Algunas apps mandan un segundo request despues del 101.
-        # Lo absorbemos si llega rapido, si no seguimos.
-        client.settimeout(1)
-        try:
-            client.recv(8192)
-        except Exception:
-            pass
         client.settimeout(None)
 
         # Conectar al SSH local y hacer de puente
         dest = socket.create_connection((host, port), timeout=10)
         dest.settimeout(None)
+
+        # Lo que ya leimos del cliente se reenvia primero, para no
+        # perder ni un byte del handshake.
+        if pendiente:
+            dest.sendall(pendiente)
 
         t1 = threading.Thread(target=forward, args=(client, dest), daemon=True)
         t2 = threading.Thread(target=forward, args=(dest, client), daemon=True)
