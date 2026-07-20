@@ -11,9 +11,11 @@
 #    - cron de vencimientos
 #
 #  Uso:
-#    bash install.sh
-#    bash install.sh --puerto-ws 80 --puerto-wss 443 --destino 22
-#    bash install.sh --sin-proxy        (solo el CLI)
+#    bash install.sh                    (pregunta por el panel)
+#    bash install.sh --con-panel        (instala todo, sin preguntar)
+#    bash install.sh --sin-panel        (todo menos el panel)
+#    bash install.sh --sin-proxy        (sin el proxy 80/443)
+#    bash install.sh --clave-panel XXX  (contraseña del panel)
 # ============================================================
 
 set -uo pipefail
@@ -27,6 +29,9 @@ PUERTO_WSS=443
 DESTINO=22
 PAYLOAD=101
 INSTALAR_PROXY=1
+INSTALAR_PANEL=""      # vacio = preguntar
+CLAVE_PANEL=""
+PUERTO_PANEL=8088
 
 V="\033[1;32m"; R="\033[1;31m"; A="\033[1;33m"; N="\033[0m"
 
@@ -44,6 +49,10 @@ while [ $# -gt 0 ]; do
         --destino)    DESTINO="$2"; shift 2 ;;
         --payload)    PAYLOAD="$2"; shift 2 ;;
         --sin-proxy)  INSTALAR_PROXY=0; shift ;;
+        --con-panel)  INSTALAR_PANEL=1; shift ;;
+        --sin-panel)  INSTALAR_PANEL=0; shift ;;
+        --clave-panel) CLAVE_PANEL="$2"; shift 2 ;;
+        --puerto-panel) PUERTO_PANEL="$2"; shift 2 ;;
         -h|--help)
             grep '^#' "$0" | head -20 | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -157,6 +166,43 @@ EOF
     fi
 fi
 
+# ── Panel web ────────────────────────────────────────────────
+# Se pregunta solo si nadie lo definio por parametro y hay a quien
+# preguntarle (si viene por tuberia, no hay terminal: se instala).
+if [ -z "$INSTALAR_PANEL" ]; then
+    if [ -t 0 ]; then
+        echo ""
+        read -r -p "  ¿Instalar tambien el panel web? [S/n]: " _resp
+        case "${_resp,,}" in
+            n|no) INSTALAR_PANEL=0 ;;
+            *)    INSTALAR_PANEL=1 ;;
+        esac
+    else
+        INSTALAR_PANEL=1
+    fi
+fi
+
+if [ "$INSTALAR_PANEL" -eq 1 ]; then
+    echo ""
+    msg "Instalando panel web..."
+    _tmp_panel=$(mktemp /tmp/ctm-panel.XXXXXX.sh)
+    if wget -q -O "$_tmp_panel" "$REPO/install-panel.sh"; then
+        _args=(--puerto "$PUERTO_PANEL")
+        [ -n "$CLAVE_PANEL" ] && _args+=(--clave "$CLAVE_PANEL")
+        bash "$_tmp_panel" "${_args[@]}"
+        PANEL_OK=1
+    else
+        warn "No se pudo descargar el instalador del panel"
+        PANEL_OK=0
+    fi
+    rm -f "$_tmp_panel"
+else
+    PANEL_OK=0
+    echo ""
+    msg "Panel web omitido. Para instalarlo despues:"
+    echo "    wget -qO- $REPO/install-panel.sh | bash"
+fi
+
 # ── Resumen ──────────────────────────────────────────────────
 IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "tu-ip")
 
@@ -178,6 +224,10 @@ echo "  Desinstalar todo:        ctmanager-cli uninstall --yes"
 echo ""
 echo "  En la app del cliente, UDPGW: 127.0.0.1:7300"
 echo ""
+if [ "${PANEL_OK:-0}" -eq 1 ]; then
+echo "  Panel web: los datos de acceso figuran arriba."
+echo ""
+fi
 if [ "$INSTALAR_PROXY" -eq 1 ]; then
 echo "  Datos para la app (HTTP Custom / similar):"
 echo "    Servidor : $IP   (mejor usar un dominio)"
