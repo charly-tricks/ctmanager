@@ -17,6 +17,7 @@ import sqlite3
 import secrets
 import hashlib
 import subprocess
+import threading
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -147,10 +148,33 @@ def leer_usuarios():
     return salida
 
 
+# Servicios que el panel puede prender, apagar e instalar.
+# La clave es el servicio; el valor, el comando del CLI que lo instala.
+GESTIONABLES = {
+    "ctmanager-ws":      "install-proxy",
+    "ctmanager-badvpn":  "install-badvpn",
+    "ctmanager-limiter": "install-limiter",
+    "ctmanager-acct":    "install-accounting",
+}
+
+# Instalaciones en curso: {servicio: "instalando" | "error: ..."}
+TAREAS = {}
+
+
+def servicio_instalado(nombre: str) -> bool:
+    return os.path.exists(f"/etc/systemd/system/{nombre}.service")
+
+
 def estado_sistema():
     servicios = {}
     for s in ("ctmanager-limiter", "ctmanager-acct", "ctmanager-ws",
               "ctmanager-badvpn", "ctmanager-panel"):
+        if s in TAREAS:
+            servicios[s] = TAREAS[s]
+            continue
+        if s in GESTIONABLES and not servicio_instalado(s):
+            servicios[s] = "no-instalado"
+            continue
         try:
             r = subprocess.run(["systemctl", "is-active", s],
                                capture_output=True, text=True, timeout=5)
@@ -259,6 +283,51 @@ BANNER_DEFECTO = (
     '<font color="blue">Vence: EXP  (DAYS dias)</font>\n'
     '<font color="orange">Consumido: TRF de LIMIT</font>\n'
 )
+
+
+@app.post("/api/servicio")
+async def servicio(request: Request):
+    exigir_sesion(request)
+    d = await request.json()
+    nombre = d.get("nombre", "")
+    accion = d.get("accion", "")
+
+    if nombre not in GESTIONABLES:
+        return {"ok": False, "error": "servicio no gestionable"}
+
+    if accion in ("start", "stop", "restart"):
+        if not servicio_instalado(nombre):
+            return {"ok": False, "error": "el servicio no está instalado"}
+        try:
+            subprocess.run(["systemctl", accion, nombre],
+                           capture_output=True, timeout=20)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "msg": "listo"}
+
+    if accion == "install":
+        if nombre in TAREAS:
+            return {"ok": False, "error": "ya se está instalando"}
+
+        def tarea():
+            # BadVPN compila desde fuente: puede tardar varios minutos.
+            TAREAS[nombre] = "instalando"
+            try:
+                r = subprocess.run([CLI, GESTIONABLES[nombre]],
+                                   capture_output=True, text=True, timeout=900)
+                if r.returncode != 0:
+                    TAREAS[nombre] = "error"
+                    time.sleep(8)
+            except Exception:
+                TAREAS[nombre] = "error"
+                time.sleep(8)
+            finally:
+                TAREAS.pop(nombre, None)
+
+        threading.Thread(target=tarea, daemon=True).start()
+        return {"ok": True, "msg": "instalando en segundo plano"}
+
+    return {"ok": False, "error": "acción desconocida"}
 
 
 @app.get("/api/banner")
@@ -388,8 +457,21 @@ PAGINA = r"""<!DOCTYPE html>
              cursor:pointer;font-family:var(--sans)}
 
   /* estado del sistema */
-  .linea{display:flex;justify-content:space-between;padding:9px 0;
-         border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .linea{display:flex;justify-content:space-between;align-items:center;
+         padding:11px 0;border-bottom:1px solid var(--line);
+         font-family:var(--mono);font-size:12px;gap:10px}
+  .linea .acc{display:flex;align-items:center;gap:9px;flex:none}
+  .mini{background:var(--raise);border:1px solid var(--line);color:var(--signal);
+        font-size:11px;padding:5px 10px;border-radius:6px;cursor:pointer;
+        font-family:var(--sans)}
+  .mini:disabled{opacity:.5;cursor:default}
+  .sw{width:38px;height:21px;background:var(--ink);border:1px solid var(--line);
+      border-radius:11px;position:relative;flex:none;cursor:pointer}
+  .sw.on{background:var(--alive);border-color:var(--alive)}
+  .sw i{position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;
+        background:var(--dim);transition:transform .15s,background .15s}
+  .sw.on i{transform:translateX(17px);background:#0D1017}
+  .cargando{color:var(--signal)}
   .linea:last-child{border:none}
   .linea span:first-child{color:var(--dim)}
   .ok{color:var(--alive)} .mal{color:var(--dead)}
@@ -634,10 +716,30 @@ async function cargar(){
     'ctmanager-panel':'Panel web',
     'ssh':'Servidor SSH'
   };
+  const gestionables = ['ctmanager-ws','ctmanager-badvpn',
+                       'ctmanager-limiter','ctmanager-acct'];
   for(const [k,v] of Object.entries(s.servicios)){
     const vivo = v === 'active';
+    let acc = '';
+
+    if(v === 'instalando'){
+      acc = '<span class="cargando">instalando…</span>';
+    } else if(v === 'error'){
+      acc = `<span class="mal">falló</span>
+             <button class="mini" onclick="servicio('${k}','install')">Reintentar</button>`;
+    } else if(v === 'no-instalado'){
+      acc = `<span style="color:var(--dim)">no instalado</span>
+             <button class="mini" onclick="servicio('${k}','install')">Instalar</button>`;
+    } else if(gestionables.includes(k)){
+      acc = `<span class="${vivo?'ok':'mal'}">${vivo?'activo':'detenido'}</span>
+             <div class="sw ${vivo?'on':''}"
+                  onclick="servicio('${k}','${vivo?'stop':'start'}')"><i></i></div>`;
+    } else {
+      acc = `<span class="${vivo?'ok':'mal'}">${vivo?'activo':v}</span>`;
+    }
+
     html += `<div class="linea"><span>${nombres[k]||k}</span>
-             <span class="${vivo?'ok':'mal'}">${vivo?'activo':v}</span></div>`;
+             <span class="acc">${acc}</span></div>`;
   }
   if(s.puertos.length){
     html += `<div class="linea"><span>Puertos abiertos</span><span>${
@@ -694,6 +796,25 @@ async function crear(){
     cargar();
   } else {
     avisar(d.error || 'No se pudo crear', true);
+  }
+}
+
+async function servicio(nombre, accion){
+  if(accion === 'stop' && !confirm('Se detiene el servicio y los clientes conectados por ahí se van a cortar. ¿Seguir?')) return;
+
+  if(accion === 'install' && nombre === 'ctmanager-badvpn'){
+    avisar('BadVPN se compila desde el código: puede tardar unos minutos.');
+  }
+
+  const d = await pedir('/api/servicio', {nombre, accion});
+  if(!d.ok){ avisar(d.error || 'No se pudo', true); return; }
+  if(accion === 'install') avisar('Instalando… el estado se actualiza solo.');
+  cargar();
+
+  // Refresco mas seguido mientras dura la instalacion
+  if(accion === 'install'){
+    let n = 0;
+    const t = setInterval(()=>{ cargar(); if(++n > 60) clearInterval(t); }, 5000);
   }
 }
 
