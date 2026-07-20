@@ -91,6 +91,10 @@ msg "Instalando limitador de dispositivos..."
 "$BIN" install-limiter >/dev/null 2>&1 && msg "Limitador activo" \
     || warn "El limitador no se pudo instalar"
 
+msg "Instalando BadVPN (soporte UDP)..."
+"$BIN" install-badvpn >/dev/null 2>&1 && msg "BadVPN activo en 127.0.0.1:7300" \
+    || warn "BadVPN no se pudo compilar (el UDP no va a funcionar)"
+
 msg "Instalando contador de datos..."
 "$BIN" install-accounting >/dev/null 2>&1 && msg "Contador de datos activo" \
     || warn "El contador de datos no se pudo instalar (revisar iptables)"
@@ -171,6 +175,8 @@ echo "  Ver todas las cuentas:   ctmanager-cli list"
 echo "  Ver consumo:             ctmanager-cli usage juan"
 echo "  Renovar:                 ctmanager-cli renew juan 30"
 echo "  Desinstalar todo:        ctmanager-cli uninstall --yes"
+echo ""
+echo "  En la app del cliente, UDPGW: 127.0.0.1:7300"
 echo ""
 if [ "$INSTALAR_PROXY" -eq 1 ]; then
 echo "  Datos para la app (HTTP Custom / similar):"
