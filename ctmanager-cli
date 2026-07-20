@@ -586,6 +586,74 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════════
+#  PROXY WEBSOCKET
+# ════════════════════════════════════════════════════════════
+# Puertos fijos 80 y 443 hacia el SSH local, igual que hacen
+# los paneles del rubro. Sin preguntas: menos soporte despues.
+WS_DIR="/etc/ctmanager/websocket"
+WS_REPO="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ws-proxy.py"
+
+cmd_install_proxy() {
+    command -v python3 >/dev/null 2>&1 || fail 1 "falta python3"
+
+    # Avisar si algo ya ocupa los puertos
+    local ocupados=""
+    for p in 80 443; do
+        if ss -tlnp 2>/dev/null | grep -q ":$p "; then
+            ocupados="$ocupados $p"
+        fi
+    done
+
+    mkdir -p "$WS_DIR"
+    wget -q -O "$WS_DIR/proxy.py" "$WS_REPO" \
+        || fail 1 "no se pudo descargar el proxy"
+
+    cat > "$WS_DIR/config.json" <<'EOF'
+{
+  "ws_port": 80,
+  "wss_port": 443,
+  "target_host": "127.0.0.1",
+  "target_port": 22,
+  "payload": "101",
+  "enable_ws": true,
+  "enable_wss": true
+}
+EOF
+
+    cat > /etc/systemd/system/ctmanager-ws.service <<'EOF'
+[Unit]
+Description=CTManager WebSocket Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /etc/ctmanager/websocket/proxy.py
+Restart=always
+RestartSec=3
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ctmanager-ws >/dev/null 2>&1
+    systemctl restart ctmanager-ws
+    sleep 2
+
+    if systemctl is-active --quiet ctmanager-ws; then
+        log "proxy websocket instalado en 80/443"
+        ok "Proxy instalado" "puertos=80 y 443" "destino=SSH 22"
+    else
+        if [ -n "$ocupados" ]; then
+            fail 1 "el proxy no arranco: los puertos$ocupados ya estan en uso"
+        fi
+        fail 1 "el proxy no arranco. Ver: journalctl -u ctmanager-ws -n 20"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
@@ -1022,6 +1090,7 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   install-limiter               instalar servicio + cron
   install-accounting            instalar contador de datos
   install-badvpn                instalar BadVPN (soporte UDP)
+  install-proxy                 instalar proxy WebSocket (80/443)
   limiter-daemon                loop del limitador (lo usa systemd)
   accounting-daemon             loop del contador (lo usa systemd)
   uninstall --yes               borrar TODO lo instalado
@@ -1060,6 +1129,7 @@ case "${1:-}" in
     install-limiter)    shift; cmd_install_limiter ;;
     install-accounting) shift; cmd_install_accounting ;;
     install-badvpn)     shift; cmd_install_badvpn ;;
+    install-proxy)      shift; cmd_install_proxy ;;
     accounting-daemon)  shift; cmd_accounting_daemon ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
