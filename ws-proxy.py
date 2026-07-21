@@ -25,6 +25,10 @@ DEFAULTS = {
     "payload": "101",
     "enable_ws": True,
     "enable_wss": True,
+    # Si V2Ray esta instalado, los pedidos a esta ruta se derivan
+    # a Xray en vez de al SSH. Asi los dos comparten el puerto 80.
+    "vless_path": "",
+    "vless_port": 0,
 }
 
 # Los \r\n van escapados. Este era el bug de la version anterior:
@@ -64,6 +68,18 @@ def forward(src, dst):
                 pass
 
 
+def ruta_del_pedido(data):
+    """Devuelve la ruta pedida en la primera linea HTTP, o cadena vacia."""
+    try:
+        primera = data.split(b"\r\n", 1)[0].decode("latin-1")
+        partes = primera.split(" ")
+        if len(partes) >= 2:
+            return partes[1].split("?")[0]
+    except Exception:
+        pass
+    return ""
+
+
 def parece_http(data):
     """True si el bloque recibido es un request HTTP y no SSH."""
     if data[:4] == b"SSH-":
@@ -82,6 +98,9 @@ def handle_client(client, cfg):
     port = int(cfg.get("target_port", 22))
     dest = None
     pendiente = b""
+    destino_vless = False
+    ruta_vless = str(cfg.get("vless_path") or "")
+    puerto_vless = int(cfg.get("vless_port") or 0)
     try:
         client.settimeout(20)
 
@@ -98,6 +117,14 @@ def handle_client(client, cfg):
             if not data:
                 break
             if parece_http(data):
+                # Si el pedido va a la ruta de V2Ray, no contestamos
+                # nosotros: el saludo WebSocket lo tiene que dar Xray.
+                if ruta_vless and puerto_vless:
+                    pedida = ruta_del_pedido(data)
+                    if pedida == ruta_vless or pedida.startswith(ruta_vless + "/"):
+                        destino_vless = True
+                        pendiente = data
+                        break
                 client.sendall(payload)
                 continue
             # Ya no es HTTP: esto es el saludo SSH, va al puente.
@@ -106,8 +133,11 @@ def handle_client(client, cfg):
 
         client.settimeout(None)
 
-        # Conectar al SSH local y hacer de puente
-        dest = socket.create_connection((host, port), timeout=10)
+        # Conectar al destino que corresponda y hacer de puente
+        if destino_vless:
+            dest = socket.create_connection(("127.0.0.1", puerto_vless), timeout=10)
+        else:
+            dest = socket.create_connection((host, port), timeout=10)
         dest.settimeout(None)
 
         # Lo que ya leimos del cliente se reenvia primero, para no
@@ -140,9 +170,12 @@ def start_server(port, cfg):
         print(f"[CTManager WS] No se pudo abrir el puerto {port}: {e}", flush=True)
         return
     srv.listen(512)
+    extra = ""
+    if cfg.get("vless_path") and cfg.get("vless_port"):
+        extra = f" | VLESS en {cfg['vless_path']} -> 127.0.0.1:{cfg['vless_port']}"
     print(f"[CTManager WS] Escuchando en {port} -> "
           f"{cfg.get('target_host')}:{cfg.get('target_port')} "
-          f"| Payload HTTP {cfg.get('payload')}", flush=True)
+          f"| Payload HTTP {cfg.get('payload')}{extra}", flush=True)
     while True:
         try:
             client, addr = srv.accept()
