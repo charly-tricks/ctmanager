@@ -251,10 +251,58 @@ async def salir(request: Request):
     return resp
 
 
+def leer_v2ray():
+    """Cuentas V2Ray. Si no esta instalado, devuelve lista vacia."""
+    if not os.path.exists("/etc/ctmanager/xray/config.json"):
+        return {"instalado": False, "cuentas": [], "tls": {}}
+    r = cli("vless", "list")
+    t = cli("tls-estado")
+    return {
+        "instalado": True,
+        "cuentas": r.get("vless", []) if r.get("ok") else [],
+        "tls": t if t.get("ok") else {},
+    }
+
+
 @app.get("/api/datos")
 async def datos(request: Request):
     exigir_sesion(request)
-    return {"usuarios": leer_usuarios(), "sistema": estado_sistema()}
+    return {"usuarios": leer_usuarios(), "sistema": estado_sistema(),
+            "v2ray": leer_v2ray()}
+
+
+@app.post("/api/v2ray/crear")
+async def v2ray_crear(request: Request):
+    exigir_sesion(request)
+    d = await request.json()
+    return cli("vless", "add",
+               str(d["usuario"]).lower().strip(),
+               str(int(d["dias"])), str(int(d["gb"])),
+               str(d.get("protocolo", "vless")))
+
+
+@app.post("/api/v2ray/accion")
+async def v2ray_accion(request: Request):
+    exigir_sesion(request)
+    d = await request.json()
+    u = str(d["usuario"]).lower().strip()
+    acc = d.get("accion", "")
+    if acc == "link":
+        return cli("vless", "link", u)
+    if acc == "borrar":
+        return cli("vless", "del", u)
+    if acc == "instalar":
+        def tarea():
+            TAREAS["v2ray"] = "instalando"
+            try:
+                subprocess.run([CLI, "install-v2ray"], capture_output=True, timeout=600)
+            except Exception:
+                pass
+            finally:
+                TAREAS.pop("v2ray", None)
+        threading.Thread(target=tarea, daemon=True).start()
+        return {"ok": True, "msg": "instalando"}
+    return {"ok": False, "error": "acción desconocida"}
 
 
 @app.post("/api/crear")
@@ -498,6 +546,21 @@ PAGINA = r"""<!DOCTYPE html>
 
   .vacio{text-align:center;color:var(--dim);padding:32px 16px;font-size:14px}
 
+  .opciones{display:flex;gap:6px;margin-bottom:8px}
+  .op{flex:1;background:var(--ink);border:1px solid var(--line);color:var(--dim);
+      font-size:12px;padding:10px 4px;border-radius:8px;cursor:pointer;
+      font-family:var(--sans)}
+  .op.elegida{border-color:var(--signal);color:var(--signal);background:var(--raise)}
+  .op:disabled{opacity:.4;cursor:default}
+
+  .enlace{background:var(--ink);border:1px solid var(--line);border-radius:8px;
+          padding:10px;font-family:var(--mono);font-size:11px;word-break:break-all;
+          color:var(--nota);margin-bottom:10px;line-height:1.5}
+  .etiqueta{display:inline-block;font-family:var(--mono);font-size:10px;
+            letter-spacing:.08em;padding:3px 7px;border-radius:5px;
+            border:1px solid var(--line);color:var(--dim)}
+  .etiqueta.tls{color:var(--alive);border-color:var(--alive)}
+
   /* interruptor de modo */
   .palanca{display:flex;align-items:center;gap:10px;cursor:pointer;
            margin-bottom:14px;user-select:none}
@@ -591,6 +654,26 @@ PAGINA = r"""<!DOCTYPE html>
       <label>Datos en GB (0 = sin límite)</label>
       <input id="nGb" type="number" value="0" inputmode="numeric">
       <button class="principal" onclick="crear()">Crear cuenta</button>
+    </div>
+
+    <h2>Cuentas V2Ray</h2>
+    <div id="v2rayLista"></div>
+    <div class="caja" id="v2rayForm" style="display:none">
+      <label>Protocolo</label>
+      <div class="opciones" id="protoOpciones">
+        <button class="op elegida" data-p="vless"     onclick="elegirProto(this)">VLESS</button>
+        <button class="op"          data-p="vmess"    onclick="elegirProto(this)">VMess</button>
+        <button class="op"          data-p="vless-tls" onclick="elegirProto(this)">VLESS + TLS</button>
+      </div>
+      <p class="ayuda" id="protoAyuda">Sin cifrar, por el puerto 80.</p>
+
+      <label>Nombre de la cuenta</label>
+      <input id="vUsuario" placeholder="cliente1" autocapitalize="off">
+      <div class="duo">
+        <div><label>Días</label><input id="vDias" type="number" value="30" inputmode="numeric"></div>
+        <div><label>Datos en GB</label><input id="vGb" type="number" value="0" inputmode="numeric"></div>
+      </div>
+      <button class="principal" onclick="crearV2ray()">Crear cuenta V2Ray</button>
     </div>
 
     <h2>Mensaje al conectar</h2>
@@ -725,6 +808,8 @@ async function cargar(){
       </div>`;
     }).join('');
   }
+
+  pintarV2ray(d.v2ray);
 
   const s = d.sistema || {servicios:{}, puertos:[]};
   let html = '';
@@ -871,6 +956,135 @@ async function servicio(nombre, accion){
     let n = 0;
     const t = setInterval(()=>{ cargar(); if(++n > 60) clearInterval(t); }, 5000);
   }
+}
+
+/* ── Cuentas V2Ray ──────────────────────────────────── */
+let protoElegido = 'vless';
+let hayTls = false;
+
+function elegirProto(btn){
+  if(btn.disabled) return;
+  document.querySelectorAll('#protoOpciones .op')
+          .forEach(b => b.classList.remove('elegida'));
+  btn.classList.add('elegida');
+  protoElegido = btn.dataset.p;
+  const textos = {
+    'vless':     'Sin cifrar, por el puerto 80.',
+    'vmess':     'Sin cifrar, por el puerto 80. Otra forma de identificar al usuario.',
+    'vless-tls': 'Cifrado con tu certificado, por el puerto 443.'
+  };
+  document.getElementById('protoAyuda').textContent = textos[protoElegido];
+}
+
+function pintarV2ray(v){
+  const cont = document.getElementById('v2rayLista');
+  const form = document.getElementById('v2rayForm');
+
+  if(!v || !v.instalado){
+    form.style.display = 'none';
+    const estado = (typeof TAREAS_V2 !== 'undefined' && TAREAS_V2) ? '' : '';
+    cont.innerHTML = `<div class="caja">
+        <p class="ayuda">V2Ray permite vender cuentas VLESS y VMess
+        además de las SSH, usando el mismo puerto 80.</p>
+        <button class="principal" onclick="instalarV2ray()">Instalar V2Ray</button>
+      </div>`;
+    return;
+  }
+
+  form.style.display = 'block';
+  hayTls = !!(v.tls && v.tls.tls);
+  const btnTls = document.querySelector('#protoOpciones .op[data-p="vless-tls"]');
+  if(btnTls){
+    btnTls.disabled = !hayTls;
+    btnTls.title = hayTls ? '' : 'Falta configurar TLS';
+  }
+
+  if(!v.cuentas.length){
+    cont.innerHTML = '<div class="vacio">Todavía no hay cuentas V2Ray.</div>';
+    return;
+  }
+
+  cont.innerHTML = v.cuentas.map(c => {
+    const cuota = c.cuota_mb ? (c.cuota_mb/1024).toFixed(0)+' GB' : 'sin límite';
+    const vence = (c.expira || '').split(' ')[0] || '∞';
+    const esTls = c.protocolo === 'vless-tls';
+    return `
+    <div class="cuenta ${c.activo ? '' : 'off'}">
+      <div class="fila1">
+        <div class="punto ${c.activo ? 'on' : 'no'}"></div>
+        <div class="nombre">${c.usuario}</div>
+        <span class="etiqueta ${esTls ? 'tls' : ''}">${(c.protocolo||'vless').toUpperCase()}</span>
+      </div>
+      <div class="consumo">
+        <span class="gasto">${tamano(c.bytes || 0)}</span>
+        <span>${cuota} · vence ${vence}</span>
+      </div>
+      <div id="link-${c.usuario}"></div>
+      <div class="botones">
+        <button onclick="verEnlace('${c.usuario}')">Ver enlace</button>
+        <button class="peligro" onclick="borrarV2ray('${c.usuario}')">Borrar</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function instalarV2ray(){
+  avisar('Instalando V2Ray, puede tardar un minuto.');
+  await pedir('/api/v2ray/accion', {usuario:'-', accion:'instalar'});
+  let n = 0;
+  const t = setInterval(()=>{ cargar(); if(++n > 24) clearInterval(t); }, 5000);
+}
+
+async function crearV2ray(){
+  const usuario = document.getElementById('vUsuario').value.trim().toLowerCase();
+  if(!usuario){ avisar('Escribí un nombre para la cuenta', true); return; }
+  const d = await pedir('/api/v2ray/crear', {
+    usuario, protocolo: protoElegido,
+    dias: +document.getElementById('vDias').value || 30,
+    gb:   +document.getElementById('vGb').value || 0
+  });
+  if(d.ok){
+    avisar('Cuenta V2Ray creada');
+    document.getElementById('vUsuario').value = '';
+    cargar();
+    setTimeout(()=> verEnlace(usuario), 700);
+  } else {
+    avisar(d.error || 'No se pudo crear', true);
+  }
+}
+
+async function verEnlace(usuario){
+  const caja = document.getElementById('link-' + usuario);
+  if(!caja) return;
+  if(caja.innerHTML){ caja.innerHTML = ''; return; }
+  const d = await pedir('/api/v2ray/accion', {usuario, accion:'link'});
+  if(!d.ok){ avisar(d.error || 'No se pudo obtener el enlace', true); return; }
+  caja.innerHTML = `<div class="enlace">${d.link}</div>
+    <div class="botones" style="margin-bottom:10px">
+      <button onclick="copiar('${encodeURIComponent(d.link)}')">Copiar enlace</button>
+    </div>`;
+}
+
+async function copiar(texto){
+  const t = decodeURIComponent(texto);
+  try{
+    await navigator.clipboard.writeText(t);
+    avisar('Enlace copiado');
+  }catch(e){
+    // En http sin cifrar el portapapeles puede estar bloqueado
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); avisar('Enlace copiado'); }
+    catch(_){ avisar('Copialo a mano desde el recuadro', true); }
+    document.body.removeChild(ta);
+  }
+}
+
+async function borrarV2ray(usuario){
+  if(!confirm('Se borra la cuenta ' + usuario + '. ¿Seguir?')) return;
+  const d = await pedir('/api/v2ray/accion', {usuario, accion:'borrar'});
+  avisar(d.ok ? 'Cuenta borrada' : (d.error || 'Falló'), !d.ok);
+  cargar();
 }
 
 /* ── Editor del mensaje al conectar ─────────────────── */
