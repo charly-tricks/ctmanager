@@ -309,6 +309,9 @@ cmd_accounting_daemon() {
         # Solo reescribe archivos, no toca sshd.
         banner_refrescar_textos
 
+        # Consumo de las cuentas VLESS (viene de la API de Xray)
+        vless_actualizar_consumo
+
         sleep "$ACCT_INTERVAL"
     done
 }
@@ -751,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.2.0"
+CLI_VERSION="1.3.0"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -905,6 +908,328 @@ cmd_bbr_estado() {
         echo "  Disciplina de cola    : ${cola:-desconocida}"
         [ "$actual" = "bbr" ] && echo "  BBR activo" || echo "  BBR no activo (usar: ctmanager-cli bbr)"
     fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  V2RAY / VLESS  (Xray-core)
+# ════════════════════════════════════════════════════════════
+# Xray escucha en 127.0.0.1:10000 con VLESS sobre WebSocket.
+# El proxy de CTManager, cuando ve que el pedido HTTP viene a la
+# ruta configurada, lo manda para alla en vez de al SSH. Asi los
+# dos protocolos comparten el puerto 80 sin pisarse.
+#
+# El conteo de datos por usuario sale de la API de estadisticas
+# de Xray, que es un mecanismo distinto al de iptables que usan
+# las cuentas SSH.
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_DIR="/etc/ctmanager/xray"
+XRAY_CFG="$XRAY_DIR/config.json"
+XRAY_PORT=10000
+XRAY_API=10085
+XRAY_PATH="/vless"
+
+vless_init_db() {
+    sqlite3 "$DB" "CREATE TABLE IF NOT EXISTS vless (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username   TEXT UNIQUE NOT NULL,
+        uuid       TEXT NOT NULL,
+        mb_limit   INTEGER DEFAULT 0,
+        bytes_uso  INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        expires_at TEXT,
+        activo     INTEGER DEFAULT 1
+    );" 2>/dev/null
+    return 0
+}
+
+vless_disponible() {
+    [ -x "$XRAY_BIN" ] && [ -f "$XRAY_CFG" ]
+}
+
+# Reescribe la lista de clientes en el config y reinicia Xray.
+vless_aplicar() {
+    vless_disponible || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+
+    local clientes="[]"
+    while IFS='|' read -r u id; do
+        [ -z "$u" ] && continue
+        clientes=$(echo "$clientes" | jq -c --arg id "$id" --arg em "$u" \
+            '. += [{"id":$id,"email":$em,"level":0}]')
+    done < <(sqlite3 "$DB" "SELECT username, uuid FROM vless WHERE activo=1;" 2>/dev/null)
+
+    local tmp; tmp=$(mktemp)
+    jq --argjson cl "$clientes" \
+       '(.inbounds[] | select(.tag=="vless-ws") | .settings.clients) = $cl' \
+       "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$XRAY_CFG"
+    systemctl restart ctmanager-xray 2>/dev/null
+    return 0
+}
+
+cmd_install_v2ray() {
+    if [ -x "$XRAY_BIN" ]; then
+        [ "$JSON" -eq 1 ] || echo "  Xray ya esta instalado, actualizando configuracion."
+    else
+        [ "$JSON" -eq 1 ] || echo "  Instalando dependencias..."
+        if   command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y -qq unzip jq curl >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q unzip jq curl >/dev/null 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm unzip jq curl >/dev/null 2>&1
+        fi
+        command -v unzip >/dev/null 2>&1 || fail 1 "falta unzip"
+        command -v jq    >/dev/null 2>&1 || fail 1 "falta jq"
+
+        local arq
+        case "$(uname -m)" in
+            x86_64|amd64)   arq="64" ;;
+            aarch64|arm64)  arq="arm64-v8a" ;;
+            armv7l)         arq="arm32-v7a" ;;
+            *) fail 1 "arquitectura no soportada: $(uname -m)" ;;
+        esac
+
+        local tmp; tmp=$(mktemp -d)
+        [ "$JSON" -eq 1 ] || echo "  Descargando Xray-core ($arq)..."
+        if ! curl -sL --max-time 120 -o "$tmp/xray.zip" \
+            "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arq}.zip"; then
+            rm -rf "$tmp"; fail 1 "no se pudo descargar Xray"
+        fi
+        unzip -qo "$tmp/xray.zip" -d "$tmp" || { rm -rf "$tmp"; fail 1 "el archivo descargado no es valido"; }
+        [ -f "$tmp/xray" ] || { rm -rf "$tmp"; fail 1 "no se encontro el binario"; }
+        install -m 755 "$tmp/xray" "$XRAY_BIN"
+        mkdir -p /usr/local/share/xray
+        cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null
+        rm -rf "$tmp"
+    fi
+
+    mkdir -p "$XRAY_DIR"
+    cat > "$XRAY_CFG" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "api": { "tag": "api", "services": ["StatsService", "HandlerService"] },
+  "stats": {},
+  "policy": {
+    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
+    "system": { "statsInboundUplink": true, "statsInboundDownlink": true }
+  },
+  "inbounds": [
+    {
+      "tag": "api-in",
+      "listen": "127.0.0.1",
+      "port": $XRAY_API,
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1" }
+    },
+    {
+      "tag": "vless-ws",
+      "listen": "127.0.0.1",
+      "port": $XRAY_PORT,
+      "protocol": "vless",
+      "settings": { "clients": [], "decryption": "none" },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": { "path": "$XRAY_PATH" }
+      }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "directo" } ],
+  "routing": {
+    "rules": [ { "type": "field", "inboundTag": ["api-in"], "outboundTag": "api" } ]
+  }
+}
+EOF
+
+    cat > /etc/systemd/system/ctmanager-xray.service <<EOF
+[Unit]
+Description=CTManager - Xray (VLESS)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$XRAY_BIN run -config $XRAY_CFG
+Restart=always
+RestartSec=5
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ctmanager-xray >/dev/null 2>&1
+    systemctl restart ctmanager-xray
+    sleep 2
+
+    vless_init_db
+    vless_aplicar
+
+    # Avisar al proxy hacia donde mandar la ruta
+    if [ -f "$WS_DIR/config.json" ] && command -v jq >/dev/null 2>&1; then
+        local tmpc; tmpc=$(mktemp)
+        jq --arg p "$XRAY_PATH" --argjson pt "$XRAY_PORT" \
+           '.vless_path = $p | .vless_port = $pt' \
+           "$WS_DIR/config.json" > "$tmpc" 2>/dev/null \
+           && mv "$tmpc" "$WS_DIR/config.json" \
+           && systemctl restart ctmanager-ws 2>/dev/null
+        rm -f "$tmpc" 2>/dev/null
+    fi
+
+    if systemctl is-active --quiet ctmanager-xray; then
+        log "xray instalado, ruta $XRAY_PATH"
+        ok "V2Ray instalado" "ruta=$XRAY_PATH" "puerto_interno=$XRAY_PORT"
+    else
+        fail 1 "Xray no arranco. Ver: journalctl -u ctmanager-xray -n 20"
+    fi
+}
+
+cmd_vless_add() {
+    vless_disponible || fail 1 "V2Ray no esta instalado (usar: ctmanager-cli install-v2ray)"
+    vless_init_db
+
+    local user="${1:-}" dias="${2:-30}" gb="${3:-0}"
+    [ -n "$user" ] || fail 2 "uso: vless add NOMBRE [DIAS] [GB]"
+    valid_user "$user" || fail 2 "nombre invalido"
+    valid_num  "$dias" || fail 2 "dias debe ser un numero"
+    valid_num  "$gb"   || fail 2 "GB debe ser un numero"
+
+    local u; u="$(sesc "$user")"
+    local existe; existe=$(sqlite3 "$DB" "SELECT COUNT(*) FROM vless WHERE username='$u';" 2>/dev/null)
+    [ "${existe:-0}" -gt 0 ] && fail 4 "ya existe una cuenta VLESS con ese nombre"
+
+    local uuid
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+    else
+        uuid=$("$XRAY_BIN" uuid 2>/dev/null)
+    fi
+    [ -n "$uuid" ] || fail 1 "no se pudo generar el identificador"
+
+    local expira_db
+    if [ "$dias" -gt 0 ]; then
+        expira_db="datetime('now', '+${dias} days')"
+    else
+        expira_db="NULL"
+    fi
+
+    sqlite3 "$DB" "INSERT INTO vless (username, uuid, mb_limit, expires_at)
+                   VALUES ('$u','$uuid',$((gb * 1024)),$expira_db);" 2>/dev/null \
+        || fail 1 "no se pudo guardar en la base"
+
+    vless_aplicar || fail 1 "no se pudo aplicar la configuracion de Xray"
+
+    log "vless add $user dias=$dias gb=$gb"
+    ok "cuenta VLESS creada" "usuario=$user" "uuid=$uuid" \
+       "cuota=$([ "$gb" -eq 0 ] && echo ilimitada || echo "${gb} GB")"
+}
+
+cmd_vless_del() {
+    local user="${1:-}"
+    [ -n "$user" ] || fail 2 "uso: vless del NOMBRE"
+    valid_user "$user" || fail 2 "nombre invalido"
+    local u; u="$(sesc "$user")"
+    sqlite3 "$DB" "DELETE FROM vless WHERE username='$u';" 2>/dev/null
+    vless_aplicar
+    log "vless del $user"
+    ok "cuenta VLESS eliminada" "usuario=$user"
+}
+
+cmd_vless_link() {
+    local user="${1:-}"
+    [ -n "$user" ] || fail 2 "uso: vless link NOMBRE"
+    valid_user "$user" || fail 2 "nombre invalido"
+    local u; u="$(sesc "$user")"
+    local uuid; uuid=$(sqlite3 "$DB" "SELECT uuid FROM vless WHERE username='$u';" 2>/dev/null)
+    [ -n "$uuid" ] || fail 3 "no existe esa cuenta"
+
+    # El host lo tiene que poner el vendedor: el servidor no sabe
+    # con que dominio lo van a usar sus clientes.
+    local host="${2:-}"
+    if [ -z "$host" ]; then
+        host=$(cat /etc/ctmanager/.dominio 2>/dev/null)
+    fi
+    [ -n "$host" ] || host=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "TU-DOMINIO")
+
+    local enlace="vless://${uuid}@${host}:80?type=ws&security=none&path=${XRAY_PATH}&encryption=none#${user}"
+
+    if [ "$JSON" -eq 1 ]; then
+        echo "{\"ok\":true,\"usuario\":\"$(jesc "$user")\",\"uuid\":\"$uuid\",\"link\":\"$(jesc "$enlace")\"}"
+    else
+        echo "  $enlace"
+    fi
+}
+
+cmd_vless_list() {
+    vless_init_db
+    if [ "$JSON" -eq 1 ]; then
+        local first=1
+        printf '{"ok":true,"vless":['
+        while IFS='|' read -r n id lim uso exp act; do
+            [ -z "$n" ] && continue
+            [ $first -eq 0 ] && printf ','
+            first=0
+            printf '{"usuario":"%s","uuid":"%s","cuota_mb":%s,"bytes":%s,"expira":"%s","activo":%s}' \
+                "$(jesc "$n")" "$id" "${lim:-0}" "${uso:-0}" "$(jesc "$exp")" "$act"
+        done < <(sqlite3 "$DB" "SELECT username,uuid,COALESCE(mb_limit,0),COALESCE(bytes_uso,0),COALESCE(expires_at,''),activo FROM vless ORDER BY id;" 2>/dev/null)
+        printf ']}\n'
+    else
+        printf "  %-18s %-38s %-8s %-12s\n" "USUARIO" "UUID" "CUOTA" "EXPIRA"
+        echo "  ---------------------------------------------------------------------------------"
+        while IFS='|' read -r n id lim uso exp act; do
+            [ -z "$n" ] && continue
+            printf "  %-18s %-38s %-8s %-12s\n" "$n" "$id" \
+                "$([ "${lim:-0}" -eq 0 ] && echo "libre" || echo "$((lim / 1024)) GB")" "${exp%% *}"
+        done < <(sqlite3 "$DB" "SELECT username,uuid,COALESCE(mb_limit,0),COALESCE(bytes_uso,0),COALESCE(expires_at,''),activo FROM vless ORDER BY id;" 2>/dev/null)
+    fi
+}
+
+# Lee los contadores de Xray y los acumula en la base.
+vless_actualizar_consumo() {
+    vless_disponible || return 0
+    local salida
+    salida=$("$XRAY_BIN" api statsquery --server="127.0.0.1:$XRAY_API" \
+             -pattern "user>>>" -reset 2>/dev/null)
+    [ -z "$salida" ] && return 0
+
+    # Formato: "user>>>NOMBRE>>>traffic>>>uplink" con su valor
+    echo "$salida" | jq -r '.stat[]? | "\(.name) \(.value // 0)"' 2>/dev/null | \
+    while read -r nombre valor; do
+        local user; user=$(echo "$nombre" | cut -d'>' -f4)
+        [ -z "$user" ] && continue
+        valid_user "$user" || continue
+        [ "${valor:-0}" -eq 0 ] && continue
+        local u; u="$(sesc "$user")"
+        sqlite3 "$DB" "UPDATE vless SET bytes_uso = COALESCE(bytes_uso,0) + $valor
+                       WHERE username='$u';" 2>/dev/null
+    done
+
+    # Desactivar a los que se pasaron de cuota o vencieron
+    while IFS= read -r user; do
+        [ -z "$user" ] && continue
+        local u; u="$(sesc "$user")"
+        sqlite3 "$DB" "UPDATE vless SET activo=0 WHERE username='$u';" 2>/dev/null
+        log "vless dado de baja (cuota o vencimiento): $user"
+    done < <(sqlite3 "$DB" "SELECT username FROM vless WHERE activo=1 AND (
+                (mb_limit > 0 AND bytes_uso >= mb_limit * 1048576)
+                OR (expires_at IS NOT NULL AND expires_at < datetime('now')));" 2>/dev/null)
+
+    vless_aplicar
+    return 0
+}
+
+cmd_vless() {
+    local sub="${1:-}"; shift 2>/dev/null
+    case "$sub" in
+        add)   cmd_vless_add "$@" ;;
+        del)   cmd_vless_del "$@" ;;
+        link)  cmd_vless_link "$@" ;;
+        list)  cmd_vless_list ;;
+        sync)  vless_actualizar_consumo; ok "consumo actualizado" ;;
+        *)     fail 2 "uso: vless add|del|link|list|sync" ;;
+    esac
 }
 
 # ════════════════════════════════════════════════════════════
@@ -1280,6 +1605,10 @@ cmd_uninstall() {
     systemctl stop ctmanager-acct 2>/dev/null
     systemctl disable ctmanager-acct 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-acct.service
+    systemctl stop ctmanager-xray 2>/dev/null
+    systemctl disable ctmanager-xray 2>/dev/null
+    rm -f /etc/systemd/system/ctmanager-xray.service
+    rm -rf "$XRAY_DIR" "$XRAY_BIN"
     systemctl stop ctmanager-badvpn 2>/dev/null
     systemctl disable ctmanager-badvpn 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-badvpn.service
@@ -1362,6 +1691,11 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   accounting-daemon             loop del contador (lo usa systemd)
   license                       ver estado de la licencia
   update                        actualizar a la ultima version
+  install-v2ray                 instalar V2Ray/VLESS en el mismo puerto 80
+  vless add NOMBRE [DIAS] [GB]  crear cuenta VLESS
+  vless link NOMBRE [DOMINIO]   ver el enlace de conexion
+  vless list                    listar cuentas VLESS
+  vless del NOMBRE              eliminar cuenta VLESS
   bbr                           activar BBR y ajustes de red
   bbr-estado                    ver si BBR esta activo
   version                       ver la version instalada
@@ -1405,6 +1739,8 @@ case "${1:-}" in
     accounting-daemon)  shift; cmd_accounting_daemon ;;
     license)         shift; cmd_license ;;
     update)          shift; cmd_update ;;
+    install-v2ray)   shift; cmd_install_v2ray ;;
+    vless)           shift; cmd_vless "$@" ;;
     bbr)             shift; cmd_bbr ;;
     bbr-estado)      shift; cmd_bbr_estado ;;
     version|-v|--version) shift; cmd_version ;;
