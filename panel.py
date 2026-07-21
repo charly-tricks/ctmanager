@@ -390,6 +390,7 @@ PAGINA = r"""<!DOCTYPE html>
     --ink:#0D1017; --panel:#151A24; --raise:#1D2431; --line:#28313F;
     --text:#E8ECF3; --dim:#7E8899;
     --signal:#F2A63B; --alive:#48D0A0; --dead:#E15A5E;
+    --nota:#5FC8DE;
     --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     --sans:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   }
@@ -489,8 +490,8 @@ PAGINA = r"""<!DOCTYPE html>
   .sw.on i{transform:translateX(17px);background:#0D1017}
   .cargando{color:var(--signal)}
   .linea .rot{display:flex;flex-direction:column;gap:2px;min-width:0}
-  .linea .nota{font-family:var(--sans);font-size:11px;color:var(--dim);
-               line-height:1.35}
+  .linea .nota{font-family:var(--sans);font-size:11px;color:var(--nota);
+               line-height:1.35;opacity:.85}
   .linea:last-child{border:none}
   .linea span:first-child{color:var(--dim)}
   .ok{color:var(--alive)} .mal{color:var(--dead)}
@@ -735,6 +736,15 @@ async function cargar(){
     'ctmanager-panel':'Panel web',
     'ssh':'Servidor SSH'
   };
+
+  const notas = {
+    'ctmanager-limiter':'Cuenta cuántos dispositivos usa cada cliente y cierra los que sobran del plan.',
+    'ctmanager-acct':'Mide los datos que consume cada cuenta y la bloquea sola cuando se termina el plan.',
+    'ctmanager-ws':'Recibe las conexiones en los puertos 80 y 443 y las lleva al SSH. Es lo que permite conectar donde el 22 está bloqueado.',
+    'ctmanager-badvpn':'Habilita el tráfico UDP: sin esto no funcionan las videollamadas, los juegos ni los audios.',
+    'ctmanager-panel':'Esta misma pantalla.',
+    'ssh':'El servidor al que se conectan los clientes.'
+  };
   const gestionables = ['ctmanager-ws','ctmanager-badvpn',
                        'ctmanager-limiter','ctmanager-acct'];
   for(const [k,v] of Object.entries(s.servicios)){
@@ -757,8 +767,11 @@ async function cargar(){
       acc = `<span class="${vivo?'ok':'mal'}">${vivo?'activo':v}</span>`;
     }
 
-    html += `<div class="linea"><span>${nombres[k]||k}</span>
-             <span class="acc">${acc}</span></div>`;
+    const nota = notas[k] ? `<span class="nota">${notas[k]}</span>` : '';
+    html += `<div class="linea">
+               <span class="rot"><span>${nombres[k]||k}</span>${nota}</span>
+               <span class="acc">${acc}</span>
+             </div>`;
   }
   if(s.bbr){
     const on = s.bbr.activo;
