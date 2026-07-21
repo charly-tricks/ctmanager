@@ -754,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.5.0"
+CLI_VERSION="1.5.1"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -968,13 +968,22 @@ vless_aplicar() {
     done < <(sqlite3 "$DB" "SELECT username, uuid, COALESCE(protocolo,'vless') FROM vless WHERE activo=1;" 2>/dev/null)
 
     local tmp; tmp=$(mktemp)
+    # Las asignaciones sobre un tag que no existe simplemente no
+    # hacen nada. No hay que envolverlas en un "if": una condicion
+    # sin coincidencias deja la salida vacia y borraria el archivo.
     jq --argjson a "$cl_vless" --argjson b "$cl_vmess" \
-       '(.inbounds[] | select(.tag=="vless-ws") | .settings.clients) = $a
-        | (.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) = $b
-        | if (.inbounds[] | select(.tag=="vless-tls")) then
-             (.inbounds[] | select(.tag=="vless-tls") | .settings.clients) = $a
-          else . end' \
+       '(.inbounds[] | select(.tag=="vless-ws")  | .settings.clients) = $a
+        | (.inbounds[] | select(.tag=="vmess-ws")  | .settings.clients) = $b
+        | (.inbounds[] | select(.tag=="vless-tls") | .settings.clients) = $a' \
        "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+    # Red de seguridad: nunca reemplazar el config por algo vacio
+    # o invalido. Un config roto deja a todos los clientes afuera.
+    if [ ! -s "$tmp" ] || ! jq empty "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        log "ERROR: la configuracion generada era invalida, no se aplico"
+        return 1
+    fi
     mv "$tmp" "$XRAY_CFG"
     systemctl restart ctmanager-xray 2>/dev/null
     return 0
@@ -1352,6 +1361,9 @@ cmd_install_tls() {
               "wsSettings": { "path": $path }
             }
           }]' "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; fail 1 "no se pudo actualizar la configuracion"; }
+    if [ ! -s "$tmp" ] || ! jq empty "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; fail 1 "la configuracion generada era invalida, no se aplico"
+    fi
     mv "$tmp" "$XRAY_CFG"
 
     printf '%s' "$dominio" > "$DOMINIO_FILE"
