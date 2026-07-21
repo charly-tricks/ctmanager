@@ -754,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.5.1"
+CLI_VERSION="1.5.2"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -955,7 +955,11 @@ vless_aplicar() {
     vless_disponible || return 1
     command -v jq >/dev/null 2>&1 || return 1
 
+    # Estas variables van declaradas como locales a proposito: en
+    # bash, un "read" dentro de una funcion pisa las variables de
+    # quien la llamo si no se declaran aca.
     local cl_vless="[]" cl_vmess="[]"
+    local u id proto
     while IFS='|' read -r u id proto; do
         [ -z "$u" ] && continue
         if [ "$proto" = "vmess" ]; then
