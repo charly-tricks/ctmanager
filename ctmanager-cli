@@ -754,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.5.3"
+CLI_VERSION="1.6.0"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -1429,6 +1429,162 @@ cmd_tls_estado() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  PSIPHON
+# ════════════════════════════════════════════════════════════
+# psiphond se compila desde el repositorio oficial de Psiphon Labs.
+# Varios paneles lo bajan ya compilado de enlaces de Drive; asi
+# sabemos que estamos corriendo el codigo publicado.
+#
+# MEEK-HTTP no puede tomar el 80 porque lo tiene el proxy, asi que
+# escucha en un puerto interno y el proxy le deriva los POST, que
+# es lo que usa ese protocolo. Para el cliente sigue siendo el 80.
+PSI_DIR="/etc/ctmanager/psiphon"
+PSI_BIN="/usr/local/bin/psiphond"
+PSI_PORT_INT=10080          # donde escucha de verdad MEEK-HTTP
+PSI_PORT_PUB=80             # lo que ve el cliente
+PSI_PORT_OSSH=2096          # MEEK-OSSH, directo
+
+cmd_install_psiphon() {
+    local puerto_ossh="${1:-$PSI_PORT_OSSH}"
+    valid_num "$puerto_ossh" || fail 2 "puerto invalido"
+
+    if ss -tlnp 2>/dev/null | grep -q ":$puerto_ossh "; then
+        fail 1 "el puerto $puerto_ossh ya esta en uso"
+    fi
+
+    if [ ! -x "$PSI_BIN" ]; then
+        [ "$JSON" -eq 1 ] || echo "  Instalando Go y dependencias..."
+        if   command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq golang-go git jq >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q golang git jq >/dev/null 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm go git jq >/dev/null 2>&1
+        fi
+        command -v go  >/dev/null 2>&1 || fail 1 "falta Go y no se pudo instalar"
+        command -v git >/dev/null 2>&1 || fail 1 "falta git"
+
+        [ "$JSON" -eq 1 ] || echo "  Compilando psiphond (esto tarda varios minutos)..."
+        local tmp; tmp=$(mktemp -d /tmp/psiphon.XXXXXX)
+        if ! git clone --depth 1 https://github.com/Psiphon-Labs/psiphon-tunnel-core.git \
+             "$tmp/src" >/dev/null 2>&1; then
+            rm -rf "$tmp"; fail 1 "no se pudo descargar el codigo de Psiphon"
+        fi
+
+        # El paquete del servidor esta en Server/. Si en alguna version
+        # cambia de lugar, se busca el main que corresponda.
+        local destino="$tmp/src/Server"
+        [ -d "$destino" ] || destino=$(find "$tmp/src" -maxdepth 2 -name "main.go" \
+                                        -path "*erver*" -printf '%h\n' 2>/dev/null | head -1)
+        [ -n "$destino" ] || { rm -rf "$tmp"; fail 1 "no se encontro el codigo del servidor"; }
+
+        if ! (cd "$destino" && GOFLAGS=-mod=mod GOCACHE="$tmp/cache" \
+              go build -o "$tmp/psiphond" . >/dev/null 2>&1); then
+            rm -rf "$tmp"
+            fail 1 "fallo la compilacion de psiphond (revisar la version de Go: se necesita 1.21 o superior)"
+        fi
+        install -m 755 "$tmp/psiphond" "$PSI_BIN"
+        rm -rf "$tmp"
+    else
+        [ "$JSON" -eq 1 ] || echo "  psiphond ya estaba compilado."
+    fi
+
+    # ── Generar la configuracion ─────────────────────────────
+    mkdir -p "$PSI_DIR"
+    if [ ! -f "$PSI_DIR/server-entry.dat" ]; then
+        [ "$JSON" -eq 1 ] || echo "  Generando configuracion..."
+        ( cd "$PSI_DIR" && "$PSI_BIN" --ipaddress 0.0.0.0 \
+            --protocol "FRONTED-MEEK-HTTP-OSSH:$PSI_PORT_PUB" \
+            --protocol "FRONTED-MEEK-OSSH:$puerto_ossh" \
+            generate >/dev/null 2>&1 )
+        [ -f "$PSI_DIR/server-entry.dat" ] || fail 1 "psiphond no genero la configuracion"
+    fi
+
+    # El cliente ve el 80, pero psiphond escucha en el puerto interno
+    # porque el 80 lo tiene el proxy.
+    if [ -f "$PSI_DIR/psiphond.config" ] && command -v jq >/dev/null 2>&1; then
+        local tmpc; tmpc=$(mktemp)
+        if jq --argjson p "$PSI_PORT_INT" \
+             '.TunnelProtocolPorts["FRONTED-MEEK-HTTP-OSSH"] = $p' \
+             "$PSI_DIR/psiphond.config" > "$tmpc" 2>/dev/null \
+           && [ -s "$tmpc" ] && jq empty "$tmpc" 2>/dev/null; then
+            mv "$tmpc" "$PSI_DIR/psiphond.config"
+        else
+            rm -f "$tmpc"
+        fi
+    fi
+
+    cat > /etc/systemd/system/ctmanager-psiphon.service <<EOF
+[Unit]
+Description=CTManager - Psiphon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PSI_DIR
+ExecStart=$PSI_BIN run
+Restart=always
+RestartSec=5
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ctmanager-psiphon >/dev/null 2>&1
+    systemctl restart ctmanager-psiphon
+    sleep 3
+
+    # Avisar al proxy que los POST van a Psiphon
+    if [ -f "$WS_DIR/config.json" ] && command -v jq >/dev/null 2>&1; then
+        local tmpw; tmpw=$(mktemp)
+        if jq --argjson p "$PSI_PORT_INT" '.psiphon_port = $p' \
+             "$WS_DIR/config.json" > "$tmpw" 2>/dev/null && [ -s "$tmpw" ]; then
+            mv "$tmpw" "$WS_DIR/config.json"
+            systemctl restart ctmanager-ws 2>/dev/null
+        else
+            rm -f "$tmpw"
+        fi
+    fi
+
+    if systemctl is-active --quiet ctmanager-psiphon; then
+        log "psiphon instalado (meek-http interno $PSI_PORT_INT, ossh $puerto_ossh)"
+        ok "Psiphon instalado" "meek_http=$PSI_PORT_PUB" "meek_ossh=$puerto_ossh" \
+           "nota=ver el codigo con: ctmanager-cli psiphon codigo"
+    else
+        fail 1 "Psiphon no arranco. Ver: journalctl -u ctmanager-psiphon -n 20"
+    fi
+}
+
+cmd_psiphon() {
+    local sub="${1:-}"
+    case "$sub" in
+        codigo|hex)
+            [ -f "$PSI_DIR/server-entry.dat" ] || fail 3 "Psiphon no esta instalado"
+            local dato; dato=$(cat "$PSI_DIR/server-entry.dat")
+            if [ "$JSON" -eq 1 ]; then
+                echo "{\"ok\":true,\"server_entry\":\"$(jesc "$dato")\"}"
+            else
+                echo "$dato"
+            fi
+            ;;
+        estado)
+            local act; act=$(systemctl is-active ctmanager-psiphon 2>/dev/null)
+            if [ "$JSON" -eq 1 ]; then
+                echo "{\"ok\":true,\"estado\":\"$act\"}"
+            else
+                echo "  Psiphon: $act"
+            fi
+            ;;
+        *) fail 2 "uso: psiphon codigo|estado" ;;
+    esac
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
@@ -1801,6 +1957,10 @@ cmd_uninstall() {
     systemctl stop ctmanager-acct 2>/dev/null
     systemctl disable ctmanager-acct 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-acct.service
+    systemctl stop ctmanager-psiphon 2>/dev/null
+    systemctl disable ctmanager-psiphon 2>/dev/null
+    rm -f /etc/systemd/system/ctmanager-psiphon.service "$PSI_BIN"
+    rm -rf "$PSI_DIR"
     systemctl stop ctmanager-xray 2>/dev/null
     systemctl disable ctmanager-xray 2>/dev/null
     rm -f /etc/systemd/system/ctmanager-xray.service
@@ -1892,6 +2052,8 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   vless add NOMBRE [DIAS] [GB] [vless|vmess|vless-tls]
                                 crear cuenta V2Ray
   tls-estado                    ver si TLS esta activo
+  install-psiphon [PUERTO]      instalar Psiphon (MEEK-OSSH, por defecto 2096)
+  psiphon codigo                ver el server-entry para los clientes
   vless link NOMBRE [DOMINIO]   ver el enlace de conexion
   vless list                    listar cuentas VLESS
   vless del NOMBRE              eliminar cuenta VLESS
@@ -1940,6 +2102,8 @@ case "${1:-}" in
     update)          shift; cmd_update ;;
     install-v2ray)   shift; cmd_install_v2ray ;;
     install-tls)     shift; cmd_install_tls "$@" ;;
+    install-psiphon) shift; cmd_install_psiphon "$@" ;;
+    psiphon)         shift; cmd_psiphon "$@" ;;
     tls-estado)      shift; cmd_tls_estado ;;
     vless)           shift; cmd_vless "$@" ;;
     bbr)             shift; cmd_bbr ;;
