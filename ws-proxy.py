@@ -29,6 +29,9 @@ DEFAULTS = {
     # a Xray en vez de al SSH. Asi los dos comparten el puerto 80.
     "vless_path": "",
     "vless_port": 0,
+    # Mapa ruta -> puerto local. Permite tener VLESS y VMess
+    # conviviendo en el mismo puerto 80, cada uno en su ruta.
+    "rutas": {},
 }
 
 # Los \r\n van escapados. Este era el bug de la version anterior:
@@ -98,9 +101,11 @@ def handle_client(client, cfg):
     port = int(cfg.get("target_port", 22))
     dest = None
     pendiente = b""
-    destino_vless = False
-    ruta_vless = str(cfg.get("vless_path") or "")
-    puerto_vless = int(cfg.get("vless_port") or 0)
+    destino_v2ray = 0
+    rutas = dict(cfg.get("rutas") or {})
+    # Compatibilidad con configuraciones viejas
+    if not rutas and cfg.get("vless_path") and cfg.get("vless_port"):
+        rutas[str(cfg["vless_path"])] = int(cfg["vless_port"])
     try:
         client.settimeout(20)
 
@@ -119,10 +124,15 @@ def handle_client(client, cfg):
             if parece_http(data):
                 # Si el pedido va a la ruta de V2Ray, no contestamos
                 # nosotros: el saludo WebSocket lo tiene que dar Xray.
-                if ruta_vless and puerto_vless:
+                if rutas:
                     pedida = ruta_del_pedido(data)
-                    if pedida == ruta_vless or pedida.startswith(ruta_vless + "/"):
-                        destino_vless = True
+                    destino = None
+                    for ruta, puerto in rutas.items():
+                        if pedida == ruta or pedida.startswith(ruta + "/"):
+                            destino = int(puerto)
+                            break
+                    if destino:
+                        destino_v2ray = destino
                         pendiente = data
                         break
                 client.sendall(payload)
@@ -134,8 +144,8 @@ def handle_client(client, cfg):
         client.settimeout(None)
 
         # Conectar al destino que corresponda y hacer de puente
-        if destino_vless:
-            dest = socket.create_connection(("127.0.0.1", puerto_vless), timeout=10)
+        if destino_v2ray:
+            dest = socket.create_connection(("127.0.0.1", destino_v2ray), timeout=10)
         else:
             dest = socket.create_connection((host, port), timeout=10)
         dest.settimeout(None)
@@ -171,8 +181,12 @@ def start_server(port, cfg):
         return
     srv.listen(512)
     extra = ""
-    if cfg.get("vless_path") and cfg.get("vless_port"):
-        extra = f" | VLESS en {cfg['vless_path']} -> 127.0.0.1:{cfg['vless_port']}"
+    rutas = cfg.get("rutas") or {}
+    if not rutas and cfg.get("vless_path"):
+        rutas = {cfg["vless_path"]: cfg.get("vless_port")}
+    if rutas:
+        detalle = ", ".join(f"{r} -> {p}" for r, p in rutas.items())
+        extra = f" | V2Ray: {detalle}"
     print(f"[CTManager WS] Escuchando en {port} -> "
           f"{cfg.get('target_host')}:{cfg.get('target_port')} "
           f"| Payload HTTP {cfg.get('payload')}{extra}", flush=True)
