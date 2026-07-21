@@ -745,6 +745,87 @@ cmd_license() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  ACTUALIZACION
+# ════════════════════════════════════════════════════════════
+# Baja la ultima version, la verifica ANTES de instalarla y
+# reinicia los servicios. Este ultimo paso es el importante:
+# los daemons quedan con el codigo viejo cargado en memoria, asi
+# que sin reiniciar los arreglos no se aplican.
+CLI_VERSION="1.1.0"
+UPDATE_URL_FILE="/etc/ctmanager/.update_url"
+UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
+
+cmd_update() {
+    local url
+    if [ -f "$UPDATE_URL_FILE" ]; then
+        url=$(tr -d '[:space:]' < "$UPDATE_URL_FILE")
+    else
+        url="$UPDATE_URL_DEFAULT"
+    fi
+
+    command -v wget >/dev/null 2>&1 || fail 1 "falta wget"
+
+    local tmp; tmp=$(mktemp /tmp/ctm-update.XXXXXX) || fail 1 "no se pudo crear el temporal"
+    [ "$JSON" -eq 1 ] || echo "  Descargando la ultima version..."
+
+    if ! wget -q -O "$tmp" "$url"; then
+        rm -f "$tmp"; fail 1 "no se pudo descargar la actualizacion"
+    fi
+
+    # Verificaciones antes de tocar nada
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; fail 1 "el archivo descargado esta vacio"
+    fi
+    if ! head -1 "$tmp" | grep -q '^#!/bin/bash'; then
+        rm -f "$tmp"; fail 1 "el archivo descargado no parece el CLI"
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; fail 1 "la version descargada tiene errores de sintaxis, no se instalo"
+    fi
+
+    local nueva anterior
+    nueva=$(grep -m1 '^CLI_VERSION=' "$tmp" | cut -d'"' -f2)
+    anterior="$CLI_VERSION"
+
+    if [ "$nueva" = "$anterior" ]; then
+        rm -f "$tmp"
+        ok "ya tenes la ultima version" "version=$anterior"
+        return 0
+    fi
+
+    # Copia de seguridad por si hay que volver atras
+    local propio; propio="$(readlink -f "$0")"
+    cp "$propio" "${propio}.backup" 2>/dev/null
+
+    install -m 755 "$tmp" "$propio"
+    rm -f "$tmp"
+
+    # Reiniciar solo los servicios que existan
+    local reiniciados=""
+    for s in ctmanager-limiter ctmanager-acct ctmanager-panel; do
+        if [ -f "/etc/systemd/system/$s.service" ]; then
+            systemctl restart "$s" 2>/dev/null && reiniciados="$reiniciados $s"
+        fi
+    done
+
+    # Regenerar banners con el codigo nuevo
+    "$propio" banner-sync >/dev/null 2>&1
+
+    log "actualizado de $anterior a ${nueva:-desconocida}"
+    ok "actualizacion completa" \
+       "antes=$anterior" "ahora=${nueva:-desconocida}" \
+       "servicios_reiniciados=$(echo "$reiniciados" | wc -w)"
+}
+
+cmd_version() {
+    if [ "$JSON" -eq 1 ]; then
+        echo "{\"ok\":true,\"version\":\"$CLI_VERSION\"}"
+    else
+        echo "  ctmanager-cli $CLI_VERSION"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
@@ -1194,6 +1275,8 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   limiter-daemon                loop del limitador (lo usa systemd)
   accounting-daemon             loop del contador (lo usa systemd)
   license                       ver estado de la licencia
+  update                        actualizar a la ultima version
+  version                       ver la version instalada
   uninstall --yes               borrar TODO lo instalado
 
   Agregar --json a cualquier comando para salida parseable.
@@ -1233,6 +1316,8 @@ case "${1:-}" in
     install-proxy)      shift; cmd_install_proxy ;;
     accounting-daemon)  shift; cmd_accounting_daemon ;;
     license)         shift; cmd_license ;;
+    update)          shift; cmd_update ;;
+    version|-v|--version) shift; cmd_version ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
     *)               fail 2 "comando desconocido: $1" ;;
