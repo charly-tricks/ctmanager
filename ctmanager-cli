@@ -191,6 +191,7 @@ mb_humano() {   # bytes -> texto legible
     local b="${1:-0}"
     if   [ "$b" -ge 1073741824 ]; then awk "BEGIN{printf \"%.2f GB\", $b/1073741824}"
     elif [ "$b" -ge 1048576 ];    then awk "BEGIN{printf \"%.1f MB\", $b/1048576}"
+    elif [ "$b" -ge 1024 ];       then awk "BEGIN{printf \"%.1f KB\", $b/1024}"
     else echo "${b} B"; fi
 }
 
@@ -389,7 +390,10 @@ banner_escribir() {
     if [ -n "$exp" ]; then
         fecha="${exp%% *}"
         local t_exp t_hoy
-        t_exp=$(date -d "$fecha" +%s 2>/dev/null || echo 0)
+        # Se usa la marca de tiempo COMPLETA (con hora). Si se tomara
+        # solo la fecha, el calculo arrancaria desde la medianoche y
+        # mostraria un dia menos que el panel.
+        t_exp=$(date -d "$exp" +%s 2>/dev/null || echo 0)
         t_hoy=$(date +%s)
         dias=$(( (t_exp - t_hoy) / 86400 ))
         [ "$dias" -lt 0 ] && dias=0
@@ -654,6 +658,93 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════════
+#  LICENCIA
+# ════════════════════════════════════════════════════════════
+# Mismo esquema que sshvendor: el token se ata a la IP del VPS
+# la primera vez que valida. Se consulta una vez por dia y el
+# resultado se cachea.
+#
+# Criterio: si la API dice explicitamente que no, se bloquea la
+# creacion de cuentas nuevas. Si no se pudo consultar (red caida,
+# API apagada), se deja pasar. Un cliente al dia no tiene por que
+# quedarse sin vender porque se cayo tu servidor.
+#
+# Las cuentas ya creadas NUNCA se tocan.
+LIC_FILE="/etc/ctmanager/.license"
+LIC_API="/etc/ctmanager/.apibase"
+LIC_CACHE="/etc/ctmanager/.license_state"
+LIC_HORAS=24
+
+licencia_verificar() {
+    # Sin archivo de licencia: instalacion libre, no se controla nada.
+    [ -f "$LIC_FILE" ] && [ -f "$LIC_API" ] || return 0
+
+    local token api
+    token=$(tr -d '[:space:]' < "$LIC_FILE" 2>/dev/null)
+    api=$(tr -d '[:space:]' < "$LIC_API" 2>/dev/null)
+    [ -n "$token" ] && [ -n "$api" ] || return 0
+
+    # Cache vigente
+    if [ -f "$LIC_CACHE" ]; then
+        local edad ahora sello estado
+        ahora=$(date +%s)
+        sello=$(head -1 "$LIC_CACHE" 2>/dev/null)
+        estado=$(sed -n 2p "$LIC_CACHE" 2>/dev/null)
+        if [[ "$sello" =~ ^[0-9]+$ ]]; then
+            edad=$(( (ahora - sello) / 3600 ))
+            if [ "$edad" -lt "$LIC_HORAS" ]; then
+                [ "$estado" = "ok" ] && return 0 || return 1
+            fi
+        fi
+    fi
+
+    command -v curl >/dev/null 2>&1 || return 0
+    local resp
+    resp=$(curl -s --max-time 10 "$api/api/validate/$token?v=ctm-1.0" 2>/dev/null)
+
+    # No se pudo consultar: se deja pasar.
+    [ -z "$resp" ] && return 0
+
+    mkdir -p "$(dirname "$LIC_CACHE")"
+    if echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+        printf '%s\nok\n' "$(date +%s)" > "$LIC_CACHE"
+        return 0
+    fi
+
+    local motivo
+    motivo=$(echo "$resp" | grep -o '"reason"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    printf '%s\nno\n%s\n' "$(date +%s)" "${motivo:-desconocido}" > "$LIC_CACHE"
+    log "licencia rechazada: ${motivo:-desconocido}"
+    return 1
+}
+
+licencia_motivo() {
+    sed -n 3p "$LIC_CACHE" 2>/dev/null || echo "desconocido"
+}
+
+cmd_license() {
+    if [ ! -f "$LIC_FILE" ]; then
+        if [ "$JSON" -eq 1 ]; then
+            echo '{"ok":true,"licencia":"libre"}'
+        else
+            echo "  Esta instalacion no tiene licencia asociada."
+        fi
+        return 0
+    fi
+    rm -f "$LIC_CACHE"     # forzar consulta
+    if licencia_verificar; then
+        ok "licencia activa"
+    else
+        local m; m=$(licencia_motivo)
+        case "$m" in
+            revoked)     fail 1 "la licencia fue dada de baja" ;;
+            ip_mismatch) fail 1 "la licencia esta atada a otro servidor" ;;
+            *)           fail 1 "licencia no valida ($m)" ;;
+        esac
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
 #  COMANDOS
 # ════════════════════════════════════════════════════════════
 
@@ -666,6 +757,15 @@ cmd_add() {
     valid_num  "$dias"   || fail 2 "dias debe ser un numero"
     valid_num  "$limite" || fail 2 "limite debe ser un numero"
     valid_num  "$gb"     || fail 2 "GB debe ser un numero"
+
+    if ! licencia_verificar; then
+        local _m; _m=$(licencia_motivo)
+        case "$_m" in
+            revoked)     fail 1 "licencia dada de baja: no se pueden crear cuentas nuevas" ;;
+            ip_mismatch) fail 1 "la licencia esta atada a otro servidor" ;;
+            *)           fail 1 "licencia no valida ($_m)" ;;
+        esac
+    fi
 
     id "$user" &>/dev/null && fail 4 "el usuario ya existe en el sistema"
     db_has "$user"        && fail 4 "el usuario ya existe en la base"
@@ -1093,6 +1193,7 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   install-proxy                 instalar proxy WebSocket (80/443)
   limiter-daemon                loop del limitador (lo usa systemd)
   accounting-daemon             loop del contador (lo usa systemd)
+  license                       ver estado de la licencia
   uninstall --yes               borrar TODO lo instalado
 
   Agregar --json a cualquier comando para salida parseable.
@@ -1131,6 +1232,7 @@ case "${1:-}" in
     install-badvpn)     shift; cmd_install_badvpn ;;
     install-proxy)      shift; cmd_install_proxy ;;
     accounting-daemon)  shift; cmd_accounting_daemon ;;
+    license)         shift; cmd_license ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
     *)               fail 2 "comando desconocido: $1" ;;
