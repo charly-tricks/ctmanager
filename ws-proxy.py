@@ -36,6 +36,9 @@ DEFAULTS = {
     # saludo TLS por el primer byte y deriva ahi, asi el 443
     # sirve para SSH sin cifrar y para V2Ray con TLS a la vez.
     "tls_port": 0,
+    # Psiphon MEEK-HTTP: se reconoce porque manda POST. El resto de
+    # los verbos siguen yendo al tunel SSH.
+    "psiphon_port": 0,
 }
 
 # Los \r\n van escapados. Este era el bug de la version anterior:
@@ -133,6 +136,13 @@ def handle_client(client, cfg):
                 pendiente = data
                 break
 
+            # Psiphon MEEK-HTTP siempre usa POST; HTTP Custom usa
+            # GET o HEAD. Con eso alcanza para repartirlos.
+            if data[:5].upper().startswith(b"POST") and int(cfg.get("psiphon_port") or 0):
+                destino_v2ray = int(cfg["psiphon_port"])
+                pendiente = data
+                break
+
             if parece_http(data):
                 # Si el pedido va a la ruta de V2Ray, no contestamos
                 # nosotros: el saludo WebSocket lo tiene que dar Xray.
@@ -201,6 +211,8 @@ def start_server(port, cfg):
         extra = f" | V2Ray: {detalle}"
     if cfg.get("tls_port"):
         extra += f" | TLS -> 127.0.0.1:{cfg['tls_port']}"
+    if cfg.get("psiphon_port"):
+        extra += f" | Psiphon(POST) -> 127.0.0.1:{cfg['psiphon_port']}"
     print(f"[CTManager WS] Escuchando en {port} -> "
           f"{cfg.get('target_host')}:{cfg.get('target_port')} "
           f"| Payload HTTP {cfg.get('payload')}{extra}", flush=True)
