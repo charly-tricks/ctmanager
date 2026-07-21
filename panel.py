@@ -193,6 +193,16 @@ def estado_sistema():
             pass
     servicios.setdefault("ssh", "inactive")
 
+    # BBR no es un servicio: es un ajuste del kernel. Se consulta aparte.
+    bbr = {"activo": False, "congestion": "?"}
+    try:
+        r = subprocess.run(["sysctl", "-n", "net.ipv4.tcp_congestion_control"],
+                           capture_output=True, text=True, timeout=5)
+        actual = r.stdout.strip()
+        bbr = {"activo": actual == "bbr", "congestion": actual or "?"}
+    except Exception:
+        pass
+
     puertos = []
     try:
         r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
@@ -213,7 +223,7 @@ def estado_sistema():
     except Exception:
         pass
     puertos.sort(key=lambda p: p["puerto"])
-    return {"servicios": servicios, "puertos": puertos}
+    return {"servicios": servicios, "puertos": puertos, "bbr": bbr}
 
 
 # ── API ──────────────────────────────────────────────────────
@@ -291,6 +301,12 @@ async def servicio(request: Request):
     d = await request.json()
     nombre = d.get("nombre", "")
     accion = d.get("accion", "")
+
+    # BBR es un ajuste del kernel, no un servicio: se activa y ya.
+    if nombre == "bbr":
+        if accion != "install":
+            return {"ok": False, "error": "BBR solo se activa"}
+        return cli("bbr")
 
     if nombre not in GESTIONABLES:
         return {"ok": False, "error": "servicio no gestionable"}
@@ -472,6 +488,9 @@ PAGINA = r"""<!DOCTYPE html>
         background:var(--dim);transition:transform .15s,background .15s}
   .sw.on i{transform:translateX(17px);background:#0D1017}
   .cargando{color:var(--signal)}
+  .linea .rot{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .linea .nota{font-family:var(--sans);font-size:11px;color:var(--dim);
+               line-height:1.35}
   .linea:last-child{border:none}
   .linea span:first-child{color:var(--dim)}
   .ok{color:var(--alive)} .mal{color:var(--dead)}
@@ -741,6 +760,23 @@ async function cargar(){
     html += `<div class="linea"><span>${nombres[k]||k}</span>
              <span class="acc">${acc}</span></div>`;
   }
+  if(s.bbr){
+    const on = s.bbr.activo;
+    const acc = on
+      ? '<span class="ok">activo</span>'
+      : `<span class="mal">${s.bbr.congestion}</span>
+         <button class="mini" onclick="servicio('bbr','install')">Activar</button>`;
+    html += `<div class="linea">
+               <span class="rot">
+                 <span>Aceleración BBR</span>
+                 <span class="nota">Mejora la velocidad cuando la conexión
+                 del cliente pierde paquetes, como pasa con datos móviles
+                 o señal débil.</span>
+               </span>
+               <span class="acc">${acc}</span>
+             </div>`;
+  }
+
   if(s.puertos.length){
     html += `<div class="linea"><span>Puertos abiertos</span><span>${
       s.puertos.map(p=>p.puerto).join(' · ')}</span></div>`;
@@ -800,6 +836,12 @@ async function crear(){
 }
 
 async function servicio(nombre, accion){
+  if(nombre === 'bbr'){
+    const d = await pedir('/api/servicio', {nombre, accion:'install'});
+    avisar(d.ok ? 'BBR activado' : (d.error || 'No se pudo activar'), !d.ok);
+    cargar();
+    return;
+  }
   if(accion === 'stop' && !confirm('Se detiene el servicio y los clientes conectados por ahí se van a cortar. ¿Seguir?')) return;
 
   if(accion === 'install' && nombre === 'ctmanager-badvpn'){
