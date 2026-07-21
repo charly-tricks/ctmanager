@@ -21,6 +21,12 @@
 set -uo pipefail
 
 REPO="https://raw.githubusercontent.com/charly-tricks/ctmanager/main"
+
+# Estos dos valores los reemplaza el servidor de licencias al
+# entregar el instalador. Si se instala directo desde GitHub
+# quedan vacios y no se controla licencia.
+LIC_TOKEN="__TOKEN__"
+LIC_API="__API_BASE__"
 WS_DIR="/etc/ctmanager/websocket"
 BIN="/usr/local/bin/ctmanager-cli"
 
@@ -95,10 +101,29 @@ chmod +x "$BIN"
 "$BIN" --help >/dev/null 2>&1 || { err "El CLI no se ejecuta correctamente"; exit 1; }
 msg "ctmanager-cli instalado"
 
+# ── Licencia ─────────────────────────────────────────────────
+if [ "$LIC_TOKEN" != "__TOKEN__" ] && [ -n "$LIC_TOKEN" ]; then
+    mkdir -p /etc/ctmanager
+    printf '%s' "$LIC_TOKEN" > /etc/ctmanager/.license
+    printf '%s' "$LIC_API"   > /etc/ctmanager/.apibase
+    chmod 600 /etc/ctmanager/.license /etc/ctmanager/.apibase
+    if "$BIN" license >/dev/null 2>&1; then
+        msg "Licencia validada"
+    else
+        err "La licencia no es valida para este servidor."
+        "$BIN" license
+        exit 1
+    fi
+fi
+
 # ── Servicios del CLI ────────────────────────────────────────
 msg "Instalando limitador de dispositivos..."
 "$BIN" install-limiter >/dev/null 2>&1 && msg "Limitador activo" \
     || warn "El limitador no se pudo instalar"
+
+msg "Activando BBR y ajustes de red..."
+"$BIN" bbr >/dev/null 2>&1 && msg "BBR activo" \
+    || warn "BBR no disponible en este kernel (no es grave)"
 
 msg "Instalando BadVPN (soporte UDP)..."
 "$BIN" install-badvpn >/dev/null 2>&1 && msg "BadVPN activo en 127.0.0.1:7300" \
