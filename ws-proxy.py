@@ -32,6 +32,10 @@ DEFAULTS = {
     # Mapa ruta -> puerto local. Permite tener VLESS y VMess
     # conviviendo en el mismo puerto 80, cada uno en su ruta.
     "rutas": {},
+    # Puerto local donde Xray escucha TLS. El proxy detecta el
+    # saludo TLS por el primer byte y deriva ahi, asi el 443
+    # sirve para SSH sin cifrar y para V2Ray con TLS a la vez.
+    "tls_port": 0,
 }
 
 # Los \r\n van escapados. Este era el bug de la version anterior:
@@ -121,6 +125,14 @@ def handle_client(client, cfg):
                 data = b""
             if not data:
                 break
+
+            # 0x16 = inicio de un saludo TLS. No es HTTP: va derecho
+            # a Xray, que es quien tiene el certificado.
+            if data[:1] == b"\x16" and int(cfg.get("tls_port") or 0):
+                destino_v2ray = int(cfg["tls_port"])
+                pendiente = data
+                break
+
             if parece_http(data):
                 # Si el pedido va a la ruta de V2Ray, no contestamos
                 # nosotros: el saludo WebSocket lo tiene que dar Xray.
@@ -187,6 +199,8 @@ def start_server(port, cfg):
     if rutas:
         detalle = ", ".join(f"{r} -> {p}" for r, p in rutas.items())
         extra = f" | V2Ray: {detalle}"
+    if cfg.get("tls_port"):
+        extra += f" | TLS -> 127.0.0.1:{cfg['tls_port']}"
     print(f"[CTManager WS] Escuchando en {port} -> "
           f"{cfg.get('target_host')}:{cfg.get('target_port')} "
           f"| Payload HTTP {cfg.get('payload')}{extra}", flush=True)
