@@ -751,7 +751,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.1.0"
+CLI_VERSION="1.2.0"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -822,6 +822,88 @@ cmd_version() {
         echo "{\"ok\":true,\"version\":\"$CLI_VERSION\"}"
     else
         echo "  ctmanager-cli $CLI_VERSION"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  BBR + AJUSTES DE RED
+# ════════════════════════════════════════════════════════════
+# BBR es el control de congestion de Google. A diferencia del
+# que trae Linux por defecto (cubic), no interpreta la perdida
+# de paquetes como saturacion. En redes moviles o rurales, donde
+# se pierden paquetes por señal y no por congestion, la mejora
+# se nota.
+#
+# Se agregan tambien algunos limites pensados para un servidor
+# con muchas conexiones simultaneas abiertas.
+SYSCTL_FILE="/etc/sysctl.d/99-ctmanager.conf"
+
+cmd_bbr() {
+    # Cargar el modulo si el kernel lo trae aparte
+    modprobe tcp_bbr 2>/dev/null
+
+    local disponibles
+    disponibles=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    if ! echo "$disponibles" | grep -qw bbr; then
+        fail 1 "este kernel no soporta BBR (disponibles: ${disponibles:-ninguno}). Se necesita Linux 4.9 o superior."
+    fi
+
+    cat > "$SYSCTL_FILE" <<'EOF'
+# CTManager - ajustes de red
+# Generado por ctmanager-cli. Para revertir: borrar este archivo
+# y ejecutar  sysctl --system
+
+# BBR: mejor rendimiento en enlaces con perdida de paquetes
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Buffers mas amplios para muchas conexiones simultaneas
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Cola de conexiones entrantes
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# Reciclar conexiones cerradas mas rapido
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_tw_reuse = 1
+
+# Detectar clientes que se desconectaron sin avisar
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+EOF
+
+    # Que el modulo se cargue en cada arranque
+    if [ -d /etc/modules-load.d ]; then
+        echo "tcp_bbr" > /etc/modules-load.d/ctmanager-bbr.conf
+    fi
+
+    sysctl --system >/dev/null 2>&1
+
+    local actual
+    actual=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$actual" = "bbr" ]; then
+        log "bbr activado"
+        ok "BBR activado" "congestion=$actual" "cola=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    else
+        fail 1 "no se pudo activar BBR (quedo en ${actual:-desconocido})"
+    fi
+}
+
+cmd_bbr_estado() {
+    local actual cola
+    actual=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    cola=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [ "$JSON" -eq 1 ]; then
+        echo "{\"ok\":true,\"congestion\":\"$actual\",\"qdisc\":\"$cola\",\"bbr\":$([ "$actual" = "bbr" ] && echo true || echo false)}"
+    else
+        echo "  Control de congestion : ${actual:-desconocido}"
+        echo "  Disciplina de cola    : ${cola:-desconocida}"
+        [ "$actual" = "bbr" ] && echo "  BBR activo" || echo "  BBR no activo (usar: ctmanager-cli bbr)"
     fi
 }
 
@@ -1217,6 +1299,10 @@ cmd_uninstall() {
         systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
     fi
 
+    # 1d. Sacar los ajustes de red
+    rm -f "$SYSCTL_FILE" /etc/modules-load.d/ctmanager-bbr.conf
+    sysctl --system >/dev/null 2>&1
+
     # 2. Sacar el cron
     rm -f /etc/cron.d/ctmanager-check
 
@@ -1276,6 +1362,8 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   accounting-daemon             loop del contador (lo usa systemd)
   license                       ver estado de la licencia
   update                        actualizar a la ultima version
+  bbr                           activar BBR y ajustes de red
+  bbr-estado                    ver si BBR esta activo
   version                       ver la version instalada
   uninstall --yes               borrar TODO lo instalado
 
@@ -1317,6 +1405,8 @@ case "${1:-}" in
     accounting-daemon)  shift; cmd_accounting_daemon ;;
     license)         shift; cmd_license ;;
     update)          shift; cmd_update ;;
+    bbr)             shift; cmd_bbr ;;
+    bbr-estado)      shift; cmd_bbr_estado ;;
     version|-v|--version) shift; cmd_version ;;
     uninstall)       shift; cmd_uninstall "$@" ;;
     ""|-h|--help)    uso ;;
