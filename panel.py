@@ -251,6 +251,24 @@ async def salir(request: Request):
     return resp
 
 
+_IP_CACHE = {"ip": "", "t": 0}
+
+
+def ip_publica():
+    """Se cachea: no tiene sentido preguntarla en cada refresco."""
+    if _IP_CACHE["ip"] and time.time() - _IP_CACHE["t"] < 3600:
+        return _IP_CACHE["ip"]
+    try:
+        r = subprocess.run(["curl", "-s", "--max-time", "6", "ifconfig.me"],
+                           capture_output=True, text=True, timeout=10)
+        ip = r.stdout.strip()
+        if ip:
+            _IP_CACHE.update({"ip": ip, "t": time.time()})
+        return ip
+    except Exception:
+        return ""
+
+
 def leer_v2ray():
     """Cuentas V2Ray. Si no esta instalado, devuelve lista vacia."""
     if not os.path.exists("/etc/ctmanager/xray/config.json"):
@@ -261,6 +279,8 @@ def leer_v2ray():
         "instalado": True,
         "cuentas": r.get("vless", []) if r.get("ok") else [],
         "tls": t if t.get("ok") else {},
+        "ip": ip_publica(),
+        "instalando_tls": "tls" in TAREAS,
     }
 
 
@@ -392,6 +412,34 @@ async def servicio(request: Request):
         return {"ok": True, "msg": "instalando en segundo plano"}
 
     return {"ok": False, "error": "acción desconocida"}
+
+
+@app.post("/api/tls")
+async def activar_tls(request: Request):
+    exigir_sesion(request)
+    d = await request.json()
+    dominio = str(d.get("dominio", "")).strip().lower()
+    correo = str(d.get("correo", "")).strip()
+
+    if not dominio or "." not in dominio or " " in dominio:
+        return {"ok": False, "error": "Escribí un dominio válido"}
+    if "tls" in TAREAS:
+        return {"ok": False, "error": "ya se está activando"}
+
+    def tarea():
+        TAREAS["tls"] = "instalando"
+        try:
+            args = [CLI, "install-tls", dominio]
+            if correo:
+                args.append(correo)
+            subprocess.run(args, capture_output=True, timeout=300)
+        except Exception:
+            pass
+        finally:
+            TAREAS.pop("tls", None)
+
+    threading.Thread(target=tarea, daemon=True).start()
+    return {"ok": True, "msg": "activando"}
 
 
 @app.get("/api/banner")
@@ -561,6 +609,15 @@ PAGINA = r"""<!DOCTYPE html>
             border:1px solid var(--line);color:var(--dim)}
   .etiqueta.tls{color:var(--alive);border-color:var(--alive)}
 
+  .info{border-left:2px solid var(--nota);padding-left:12px;margin-bottom:14px}
+  .info h4{font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text)}
+  .info p, .info li{font-size:12px;color:var(--nota);line-height:1.55;opacity:.9}
+  .info ol{margin:6px 0 0 16px}
+  .info li{margin-bottom:4px}
+  .info code{font-family:var(--mono);background:var(--ink);padding:1px 5px;
+             border-radius:4px;font-size:11px;color:var(--text)}
+  .aviso-clave{color:var(--signal);font-size:12px;margin-top:8px;line-height:1.5}
+
   /* interruptor de modo */
   .palanca{display:flex;align-items:center;gap:10px;cursor:pointer;
            margin-bottom:14px;user-select:none}
@@ -658,6 +715,8 @@ PAGINA = r"""<!DOCTYPE html>
 
     <h2>Cuentas V2Ray</h2>
     <div id="v2rayLista"></div>
+    <div class="caja" id="tlsCaja" style="display:none"></div>
+
     <div class="caja" id="v2rayForm" style="display:none">
       <label>Protocolo</label>
       <div class="opciones" id="protoOpciones">
@@ -979,6 +1038,7 @@ function elegirProto(btn){
 function pintarV2ray(v){
   const cont = document.getElementById('v2rayLista');
   const form = document.getElementById('v2rayForm');
+  pintarTls(v);
 
   if(!v || !v.instalado){
     form.style.display = 'none';
@@ -1026,6 +1086,72 @@ function pintarV2ray(v){
       </div>
     </div>`;
   }).join('');
+}
+
+function pintarTls(v){
+  const caja = document.getElementById('tlsCaja');
+  if(!v || !v.instalado){ caja.style.display='none'; return; }
+  caja.style.display = 'block';
+
+  if(v.instalando_tls){
+    caja.innerHTML = `<div class="info"><h4>Activando conexión segura…</h4>
+      <p>Se está pidiendo el certificado. Puede tardar hasta un minuto
+      y el servicio se corta unos segundos.</p></div>`;
+    return;
+  }
+
+  if(v.tls && v.tls.tls){
+    caja.innerHTML = `<div class="info">
+        <h4>Conexión segura activa</h4>
+        <p>Dominio: <code>${v.tls.dominio}</code><br>
+        El certificado vence el ${v.tls.vence || 'desconocido'} y se
+        renueva solo.</p>
+      </div>
+      <p class="ayuda">Ya podés crear cuentas con la opción
+      <strong>VLESS + TLS</strong>.</p>`;
+    return;
+  }
+
+  caja.innerHTML = `
+    <div class="info">
+      <h4>Conexión segura (TLS)</h4>
+      <p>Sin esto, las cuentas V2Ray viajan sin cifrar por el puerto 80.
+      Con TLS el tráfico va cifrado por el 443 y es mucho más difícil de
+      bloquear. Necesitás un dominio propio apuntando a este servidor.</p>
+      <h4 style="margin-top:12px">Cómo apuntar tu dominio</h4>
+      <ol>
+        <li>Entrá a Cloudflare y elegí tu dominio.</li>
+        <li>Andá a <strong>DNS → Agregar registro</strong>.</li>
+        <li>Tipo <code>A</code>, nombre el subdominio que quieras
+            (por ejemplo <code>vpn</code>).</li>
+        <li>En contenido poné la IP de este servidor:
+            <code>${v.ip || 'la IP de tu VPS'}</code></li>
+        <li>Guardá y esperá un par de minutos.</li>
+      </ol>
+      <p class="aviso-clave">Importante: la nube al lado del registro
+      tiene que quedar <strong>gris</strong> (solo DNS). Si la dejás
+      naranja, Cloudflare intercepta el tráfico y las conexiones no
+      funcionan.</p>
+    </div>
+    <label>Tu dominio</label>
+    <input id="tlsDominio" placeholder="vpn.tudominio.com" autocapitalize="off">
+    <label>Correo (opcional, para avisos del certificado)</label>
+    <input id="tlsCorreo" placeholder="tucorreo@ejemplo.com" autocapitalize="off">
+    <button class="principal" onclick="activarTls()">Activar conexión segura</button>`;
+}
+
+async function activarTls(){
+  const dominio = (document.getElementById('tlsDominio').value || '').trim().toLowerCase();
+  const correo  = (document.getElementById('tlsCorreo').value || '').trim();
+  if(!dominio){ avisar('Escribí tu dominio', true); return; }
+  if(!confirm('El servicio se va a cortar unos segundos mientras se pide el certificado. ¿Seguir?')) return;
+
+  const d = await pedir('/api/tls', {dominio, correo});
+  if(!d.ok){ avisar(d.error || 'No se pudo', true); return; }
+  avisar('Pidiendo el certificado…');
+  cargar();
+  let n = 0;
+  const t = setInterval(()=>{ cargar(); if(++n > 24) clearInterval(t); }, 5000);
 }
 
 async function instalarV2ray(){
