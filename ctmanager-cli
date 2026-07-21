@@ -754,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.3.0"
+CLI_VERSION="1.4.0"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -924,9 +924,11 @@ cmd_bbr_estado() {
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_DIR="/etc/ctmanager/xray"
 XRAY_CFG="$XRAY_DIR/config.json"
-XRAY_PORT=10000
 XRAY_API=10085
+XRAY_PORT=10000          # VLESS
 XRAY_PATH="/vless"
+XRAY_PORT_VM=10001       # VMess
+XRAY_PATH_VM="/vmess"
 
 vless_init_db() {
     sqlite3 "$DB" "CREATE TABLE IF NOT EXISTS vless (
@@ -937,8 +939,10 @@ vless_init_db() {
         bytes_uso  INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now')),
         expires_at TEXT,
-        activo     INTEGER DEFAULT 1
+        activo     INTEGER DEFAULT 1,
+        protocolo  TEXT DEFAULT 'vless'
     );" 2>/dev/null
+    sqlite3 "$DB" "ALTER TABLE vless ADD COLUMN protocolo TEXT DEFAULT 'vless';" 2>/dev/null
     return 0
 }
 
@@ -951,16 +955,22 @@ vless_aplicar() {
     vless_disponible || return 1
     command -v jq >/dev/null 2>&1 || return 1
 
-    local clientes="[]"
-    while IFS='|' read -r u id; do
+    local cl_vless="[]" cl_vmess="[]"
+    while IFS='|' read -r u id proto; do
         [ -z "$u" ] && continue
-        clientes=$(echo "$clientes" | jq -c --arg id "$id" --arg em "$u" \
-            '. += [{"id":$id,"email":$em,"level":0}]')
-    done < <(sqlite3 "$DB" "SELECT username, uuid FROM vless WHERE activo=1;" 2>/dev/null)
+        if [ "$proto" = "vmess" ]; then
+            cl_vmess=$(echo "$cl_vmess" | jq -c --arg id "$id" --arg em "$u" \
+                '. += [{"id":$id,"email":$em,"level":0,"alterId":0}]')
+        else
+            cl_vless=$(echo "$cl_vless" | jq -c --arg id "$id" --arg em "$u" \
+                '. += [{"id":$id,"email":$em,"level":0}]')
+        fi
+    done < <(sqlite3 "$DB" "SELECT username, uuid, COALESCE(protocolo,'vless') FROM vless WHERE activo=1;" 2>/dev/null)
 
     local tmp; tmp=$(mktemp)
-    jq --argjson cl "$clientes" \
-       '(.inbounds[] | select(.tag=="vless-ws") | .settings.clients) = $cl' \
+    jq --argjson a "$cl_vless" --argjson b "$cl_vmess" \
+       '(.inbounds[] | select(.tag=="vless-ws") | .settings.clients) = $a
+        | (.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) = $b' \
        "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$XRAY_CFG"
     systemctl restart ctmanager-xray 2>/dev/null
@@ -1033,6 +1043,17 @@ cmd_install_v2ray() {
         "network": "ws",
         "wsSettings": { "path": "$XRAY_PATH" }
       }
+    },
+    {
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "port": $XRAY_PORT_VM,
+      "protocol": "vmess",
+      "settings": { "clients": [] },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": { "path": "$XRAY_PATH_VM" }
+      }
     }
   ],
   "outbounds": [ { "protocol": "freedom", "tag": "directo" } ],
@@ -1071,7 +1092,9 @@ EOF
     if [ -f "$WS_DIR/config.json" ] && command -v jq >/dev/null 2>&1; then
         local tmpc; tmpc=$(mktemp)
         jq --arg p "$XRAY_PATH" --argjson pt "$XRAY_PORT" \
-           '.vless_path = $p | .vless_port = $pt' \
+           --arg pv "$XRAY_PATH_VM" --argjson ptv "$XRAY_PORT_VM" \
+           '.vless_path = $p | .vless_port = $pt
+            | .rutas = { ($p): $pt, ($pv): $ptv }' \
            "$WS_DIR/config.json" > "$tmpc" 2>/dev/null \
            && mv "$tmpc" "$WS_DIR/config.json" \
            && systemctl restart ctmanager-ws 2>/dev/null
@@ -1079,8 +1102,8 @@ EOF
     fi
 
     if systemctl is-active --quiet ctmanager-xray; then
-        log "xray instalado, ruta $XRAY_PATH"
-        ok "V2Ray instalado" "ruta=$XRAY_PATH" "puerto_interno=$XRAY_PORT"
+        log "xray instalado, rutas $XRAY_PATH y $XRAY_PATH_VM"
+        ok "V2Ray instalado" "vless=$XRAY_PATH" "vmess=$XRAY_PATH_VM"
     else
         fail 1 "Xray no arranco. Ver: journalctl -u ctmanager-xray -n 20"
     fi
@@ -1090,8 +1113,9 @@ cmd_vless_add() {
     vless_disponible || fail 1 "V2Ray no esta instalado (usar: ctmanager-cli install-v2ray)"
     vless_init_db
 
-    local user="${1:-}" dias="${2:-30}" gb="${3:-0}"
-    [ -n "$user" ] || fail 2 "uso: vless add NOMBRE [DIAS] [GB]"
+    local user="${1:-}" dias="${2:-30}" gb="${3:-0}" proto="${4:-vless}"
+    [ -n "$user" ] || fail 2 "uso: vless add NOMBRE [DIAS] [GB] [vless|vmess]"
+    case "$proto" in vless|vmess) ;; *) fail 2 "protocolo invalido: usar vless o vmess" ;; esac
     valid_user "$user" || fail 2 "nombre invalido"
     valid_num  "$dias" || fail 2 "dias debe ser un numero"
     valid_num  "$gb"   || fail 2 "GB debe ser un numero"
@@ -1115,14 +1139,14 @@ cmd_vless_add() {
         expira_db="NULL"
     fi
 
-    sqlite3 "$DB" "INSERT INTO vless (username, uuid, mb_limit, expires_at)
-                   VALUES ('$u','$uuid',$((gb * 1024)),$expira_db);" 2>/dev/null \
+    sqlite3 "$DB" "INSERT INTO vless (username, uuid, mb_limit, expires_at, protocolo)
+                   VALUES ('$u','$uuid',$((gb * 1024)),$expira_db,'$proto');" 2>/dev/null \
         || fail 1 "no se pudo guardar en la base"
 
     vless_aplicar || fail 1 "no se pudo aplicar la configuracion de Xray"
 
-    log "vless add $user dias=$dias gb=$gb"
-    ok "cuenta VLESS creada" "usuario=$user" "uuid=$uuid" \
+    log "vless add $user dias=$dias gb=$gb proto=$proto"
+    ok "cuenta ${proto^^} creada" "usuario=$user" "uuid=$uuid" "protocolo=$proto" \
        "cuota=$([ "$gb" -eq 0 ] && echo ilimitada || echo "${gb} GB")"
 }
 
@@ -1142,8 +1166,10 @@ cmd_vless_link() {
     [ -n "$user" ] || fail 2 "uso: vless link NOMBRE"
     valid_user "$user" || fail 2 "nombre invalido"
     local u; u="$(sesc "$user")"
-    local uuid; uuid=$(sqlite3 "$DB" "SELECT uuid FROM vless WHERE username='$u';" 2>/dev/null)
-    [ -n "$uuid" ] || fail 3 "no existe esa cuenta"
+    local fila; fila=$(sqlite3 "$DB" "SELECT uuid, COALESCE(protocolo,'vless') FROM vless WHERE username='$u';" 2>/dev/null)
+    [ -n "$fila" ] || fail 3 "no existe esa cuenta"
+    local uuid proto
+    IFS='|' read -r uuid proto <<< "$fila"
 
     # El host lo tiene que poner el vendedor: el servidor no sabe
     # con que dominio lo van a usar sus clientes.
@@ -1153,10 +1179,19 @@ cmd_vless_link() {
     fi
     [ -n "$host" ] || host=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "TU-DOMINIO")
 
-    local enlace="vless://${uuid}@${host}:80?type=ws&security=none&path=${XRAY_PATH}&encryption=none#${user}"
+    local enlace
+    if [ "$proto" = "vmess" ]; then
+        # VMess se comparte como JSON en base64
+        local json
+        json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"80","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":""}' \
+               "$user" "$host" "$uuid" "$host" "$XRAY_PATH_VM")
+        enlace="vmess://$(printf '%s' "$json" | base64 -w0)"
+    else
+        enlace="vless://${uuid}@${host}:80?type=ws&security=none&host=${host}&path=${XRAY_PATH}&encryption=none#${user}"
+    fi
 
     if [ "$JSON" -eq 1 ]; then
-        echo "{\"ok\":true,\"usuario\":\"$(jesc "$user")\",\"uuid\":\"$uuid\",\"link\":\"$(jesc "$enlace")\"}"
+        echo "{\"ok\":true,\"usuario\":\"$(jesc "$user")\",\"uuid\":\"$uuid\",\"protocolo\":\"$proto\",\"link\":\"$(jesc "$enlace")\"}"
     else
         echo "  $enlace"
     fi
@@ -1176,13 +1211,13 @@ cmd_vless_list() {
         done < <(sqlite3 "$DB" "SELECT username,uuid,COALESCE(mb_limit,0),COALESCE(bytes_uso,0),COALESCE(expires_at,''),activo FROM vless ORDER BY id;" 2>/dev/null)
         printf ']}\n'
     else
-        printf "  %-18s %-38s %-8s %-12s\n" "USUARIO" "UUID" "CUOTA" "EXPIRA"
+        printf "  %-16s %-8s %-38s %-8s %-11s\n" "USUARIO" "PROTO" "UUID" "CUOTA" "EXPIRA"
         echo "  ---------------------------------------------------------------------------------"
-        while IFS='|' read -r n id lim uso exp act; do
+        while IFS='|' read -r n id lim uso exp act pr; do
             [ -z "$n" ] && continue
-            printf "  %-18s %-38s %-8s %-12s\n" "$n" "$id" \
+            printf "  %-16s %-8s %-38s %-8s %-11s\n" "$n" "${pr:-vless}" "$id" \
                 "$([ "${lim:-0}" -eq 0 ] && echo "libre" || echo "$((lim / 1024)) GB")" "${exp%% *}"
-        done < <(sqlite3 "$DB" "SELECT username,uuid,COALESCE(mb_limit,0),COALESCE(bytes_uso,0),COALESCE(expires_at,''),activo FROM vless ORDER BY id;" 2>/dev/null)
+        done < <(sqlite3 "$DB" "SELECT username,uuid,COALESCE(mb_limit,0),COALESCE(bytes_uso,0),COALESCE(expires_at,''),activo,COALESCE(protocolo,'vless') FROM vless ORDER BY id;" 2>/dev/null)
     fi
 }
 
@@ -1692,7 +1727,8 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   license                       ver estado de la licencia
   update                        actualizar a la ultima version
   install-v2ray                 instalar V2Ray/VLESS en el mismo puerto 80
-  vless add NOMBRE [DIAS] [GB]  crear cuenta VLESS
+  vless add NOMBRE [DIAS] [GB] [vless|vmess]
+                                crear cuenta V2Ray
   vless link NOMBRE [DOMINIO]   ver el enlace de conexion
   vless list                    listar cuentas VLESS
   vless del NOMBRE              eliminar cuenta VLESS
