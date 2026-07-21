@@ -754,7 +754,7 @@ cmd_license() {
 # reinicia los servicios. Este ultimo paso es el importante:
 # los daemons quedan con el codigo viejo cargado en memoria, asi
 # que sin reiniciar los arreglos no se aplican.
-CLI_VERSION="1.4.0"
+CLI_VERSION="1.5.0"
 UPDATE_URL_FILE="/etc/ctmanager/.update_url"
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/charly-tricks/ctmanager/main/ctmanager-cli"
 
@@ -970,7 +970,10 @@ vless_aplicar() {
     local tmp; tmp=$(mktemp)
     jq --argjson a "$cl_vless" --argjson b "$cl_vmess" \
        '(.inbounds[] | select(.tag=="vless-ws") | .settings.clients) = $a
-        | (.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) = $b' \
+        | (.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) = $b
+        | if (.inbounds[] | select(.tag=="vless-tls")) then
+             (.inbounds[] | select(.tag=="vless-tls") | .settings.clients) = $a
+          else . end' \
        "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$XRAY_CFG"
     systemctl restart ctmanager-xray 2>/dev/null
@@ -1115,7 +1118,14 @@ cmd_vless_add() {
 
     local user="${1:-}" dias="${2:-30}" gb="${3:-0}" proto="${4:-vless}"
     [ -n "$user" ] || fail 2 "uso: vless add NOMBRE [DIAS] [GB] [vless|vmess]"
-    case "$proto" in vless|vmess) ;; *) fail 2 "protocolo invalido: usar vless o vmess" ;; esac
+    case "$proto" in
+        vless|vmess|vless-tls) ;;
+        tls) proto="vless-tls" ;;
+        *) fail 2 "protocolo invalido: usar vless, vmess o vless-tls" ;;
+    esac
+    if [ "$proto" = "vless-tls" ] && [ ! -f "$DOMINIO_FILE" ]; then
+        fail 1 "TLS no esta configurado (usar: ctmanager-cli install-tls TU-DOMINIO)"
+    fi
     valid_user "$user" || fail 2 "nombre invalido"
     valid_num  "$dias" || fail 2 "dias debe ser un numero"
     valid_num  "$gb"   || fail 2 "GB debe ser un numero"
@@ -1180,7 +1190,11 @@ cmd_vless_link() {
     [ -n "$host" ] || host=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "TU-DOMINIO")
 
     local enlace
-    if [ "$proto" = "vmess" ]; then
+    if [ "$proto" = "vless-tls" ]; then
+        local dom; dom=$(cat "$DOMINIO_FILE" 2>/dev/null)
+        [ -n "$dom" ] && host="$dom"
+        enlace="vless://${uuid}@${host}:443?type=ws&security=tls&sni=${host}&host=${host}&path=${XRAY_PATH}&encryption=none#${user}"
+    elif [ "$proto" = "vmess" ]; then
         # VMess se comparte como JSON en base64
         local json
         json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"80","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":""}' \
@@ -1265,6 +1279,136 @@ cmd_vless() {
         sync)  vless_actualizar_consumo; ok "consumo actualizado" ;;
         *)     fail 2 "uso: vless add|del|link|list|sync" ;;
     esac
+}
+
+# ── TLS para V2Ray ───────────────────────────────────────────
+# El proxy detecta si la conexion es TLS mirando el primer byte
+# y la deriva a Xray. Asi el 443 sigue sirviendo para SSH sin
+# cifrar y ademas acepta VLESS sobre TLS.
+XRAY_PORT_TLS=10002
+DOMINIO_FILE="/etc/ctmanager/.dominio"
+
+cmd_install_tls() {
+    local dominio="${1:-}"
+    local correo="${2:-}"
+
+    [ -n "$dominio" ] || fail 2 "uso: install-tls DOMINIO [CORREO]"
+    vless_disponible || fail 1 "primero instalar V2Ray (ctmanager-cli install-v2ray)"
+
+    # El dominio tiene que apuntar aca o el certificado no se emite
+    local ip_dominio ip_propia
+    ip_dominio=$(getent hosts "$dominio" 2>/dev/null | awk '{print $1}' | head -1)
+    ip_propia=$(curl -s --max-time 8 ifconfig.me 2>/dev/null)
+    if [ -n "$ip_dominio" ] && [ -n "$ip_propia" ] && [ "$ip_dominio" != "$ip_propia" ]; then
+        fail 1 "el dominio apunta a $ip_dominio y este servidor es $ip_propia"
+    fi
+
+    if ! command -v certbot >/dev/null 2>&1; then
+        [ "$JSON" -eq 1 ] || echo "  Instalando certbot..."
+        if   command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y -qq certbot >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q certbot >/dev/null 2>&1
+        fi
+        command -v certbot >/dev/null 2>&1 || fail 1 "no se pudo instalar certbot"
+    fi
+
+    local vivo="/etc/letsencrypt/live/$dominio"
+    if [ ! -f "$vivo/fullchain.pem" ]; then
+        # Certbot necesita el puerto 80 libre unos segundos
+        [ "$JSON" -eq 1 ] || echo "  Emitiendo certificado (el proxy se corta unos segundos)..."
+        systemctl stop ctmanager-ws 2>/dev/null
+        local args=(certonly --standalone -d "$dominio" --non-interactive --agree-tos)
+        if [ -n "$correo" ]; then args+=(-m "$correo"); else args+=(--register-unsafely-without-email); fi
+        certbot "${args[@]}" >/dev/null 2>&1
+        local resultado=$?
+        systemctl start ctmanager-ws 2>/dev/null
+        [ -f "$vivo/fullchain.pem" ] || fail 1 "no se pudo emitir el certificado (revisar que el puerto 80 sea alcanzable desde internet)"
+    else
+        [ "$JSON" -eq 1 ] || echo "  Ya existe un certificado para $dominio, se reutiliza."
+    fi
+
+    # Xray corre como root, pero igual conviene dejar los permisos claros
+    chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null
+
+    # Agregar el inbound con TLS
+    local tmp; tmp=$(mktemp)
+    jq --argjson pt "$XRAY_PORT_TLS" --arg path "$XRAY_PATH" \
+       --arg cert "$vivo/fullchain.pem" --arg key "$vivo/privkey.pem" \
+       'del(.inbounds[] | select(.tag=="vless-tls"))
+        | .inbounds += [{
+            "tag": "vless-tls",
+            "listen": "127.0.0.1",
+            "port": $pt,
+            "protocol": "vless",
+            "settings": { "clients": [], "decryption": "none" },
+            "streamSettings": {
+              "network": "ws",
+              "security": "tls",
+              "tlsSettings": {
+                "certificates": [ { "certificateFile": $cert, "keyFile": $key } ]
+              },
+              "wsSettings": { "path": $path }
+            }
+          }]' "$XRAY_CFG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; fail 1 "no se pudo actualizar la configuracion"; }
+    mv "$tmp" "$XRAY_CFG"
+
+    printf '%s' "$dominio" > "$DOMINIO_FILE"
+
+    # Avisar al proxy a donde mandar el trafico TLS
+    if [ -f "$WS_DIR/config.json" ]; then
+        local tmpc; tmpc=$(mktemp)
+        jq --argjson pt "$XRAY_PORT_TLS" '.tls_port = $pt' \
+           "$WS_DIR/config.json" > "$tmpc" 2>/dev/null \
+           && mv "$tmpc" "$WS_DIR/config.json"
+        rm -f "$tmpc" 2>/dev/null
+    fi
+
+    # Renovacion automatica: recargar Xray cuando cambie el certificado
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/ctmanager.sh <<'EOF'
+#!/bin/bash
+systemctl restart ctmanager-xray 2>/dev/null
+exit 0
+EOF
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/ctmanager.sh
+
+    vless_aplicar
+    systemctl restart ctmanager-ws 2>/dev/null
+    sleep 2
+
+    if systemctl is-active --quiet ctmanager-xray; then
+        log "tls activado para $dominio"
+        ok "TLS activado" "dominio=$dominio" "puerto=443" \
+           "nota=las cuentas nuevas pueden crearse con o sin TLS"
+    else
+        fail 1 "Xray no arranco con TLS. Ver: journalctl -u ctmanager-xray -n 20"
+    fi
+}
+
+cmd_tls_estado() {
+    local dominio activo
+    dominio=$(cat "$DOMINIO_FILE" 2>/dev/null)
+    if [ -n "$dominio" ] && [ -f "/etc/letsencrypt/live/$dominio/fullchain.pem" ]; then
+        activo=1
+    else
+        activo=0
+    fi
+    local vence=""
+    if [ "$activo" = "1" ]; then
+        vence=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$dominio/fullchain.pem" 2>/dev/null | cut -d= -f2)
+    fi
+    if [ "$JSON" -eq 1 ]; then
+        echo "{\"ok\":true,\"tls\":$([ "$activo" = "1" ] && echo true || echo false),\"dominio\":\"$(jesc "${dominio:-}")\",\"vence\":\"$(jesc "${vence:-}")\"}"
+    else
+        if [ "$activo" = "1" ]; then
+            echo "  TLS activo para $dominio"
+            echo "  Certificado vence: ${vence:-desconocido}"
+        else
+            echo "  TLS no configurado (usar: ctmanager-cli install-tls TU-DOMINIO)"
+        fi
+    fi
 }
 
 # ════════════════════════════════════════════════════════════
@@ -1727,8 +1871,10 @@ ctmanager-cli - gestion de usuarios SSH (by CHARLY_TRICKS)
   license                       ver estado de la licencia
   update                        actualizar a la ultima version
   install-v2ray                 instalar V2Ray/VLESS en el mismo puerto 80
-  vless add NOMBRE [DIAS] [GB] [vless|vmess]
+  install-tls DOMINIO [CORREO]  activar TLS con certificado propio
+  vless add NOMBRE [DIAS] [GB] [vless|vmess|vless-tls]
                                 crear cuenta V2Ray
+  tls-estado                    ver si TLS esta activo
   vless link NOMBRE [DOMINIO]   ver el enlace de conexion
   vless list                    listar cuentas VLESS
   vless del NOMBRE              eliminar cuenta VLESS
@@ -1776,6 +1922,8 @@ case "${1:-}" in
     license)         shift; cmd_license ;;
     update)          shift; cmd_update ;;
     install-v2ray)   shift; cmd_install_v2ray ;;
+    install-tls)     shift; cmd_install_tls "$@" ;;
+    tls-estado)      shift; cmd_tls_estado ;;
     vless)           shift; cmd_vless "$@" ;;
     bbr)             shift; cmd_bbr ;;
     bbr-estado)      shift; cmd_bbr_estado ;;
